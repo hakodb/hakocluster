@@ -1,0 +1,11 @@
+[package]
+name = "hakocluster"
+version = "0.1.0"
+edition = "2021"
+description = "In-process dispatcher over N hakodb instances: reads fan out, writes route, socket_sync keeps replicas identical"
+license = "MIT"
+repository = "https://github.com/hakodb/hakocluster"
+
+[dependencies]
+hakodb = "0.9"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
