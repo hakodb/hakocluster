@@ -65,8 +65,11 @@ pub struct ClusterConfig {
     /// Flush-cadence stagger across instances (default: 1ms-spaced starts).
     pub stagger: StaggerPolicy,
     /// Lag guard: eject a replica from fan-out when it trails the writer
-    /// by more than this many versions (version-map delta); re-admit at
-    /// half the threshold (hysteresis against flapping). `None` disables.
+    /// by more than this many versions (version-map delta). Versions are
+    /// write-micros, so the delta doubles as staleness: a healthy replica
+    /// trails by ~ the socket tail cadence (500ms = 500_000). Default
+    /// 5_000_000 (~10x the tail) tolerates jitter without flapping.
+    /// Re-admit at half the threshold (hysteresis). `None` disables.
     /// The writer (index 0) never ejects.
     pub max_replica_lag_versions: Option<u64>,
     /// Directory holding one `instance-{i}.sock` per member.
@@ -79,7 +82,7 @@ impl Default for ClusterConfig {
             durability_mode: hakodb::config::DurabilityMode::Interval,
             group_commit_interval_ms: 5,
             stagger: StaggerPolicy::StaggeredStart { offset_ms: 1 },
-            max_replica_lag_versions: Some(10_000),
+            max_replica_lag_versions: Some(5_000_000),
             sock_dir: PathBuf::from("socks"),
         }
     }
@@ -122,7 +125,8 @@ struct Instance {
 pub struct ReplicaHealth {
     /// Instance index (0 = designated writer, always healthy).
     pub index: usize,
-    /// Max version-map delta vs the writer (0 = converged).
+    /// Max version-map delta vs the writer (0 = converged). Versions are
+    /// write-micros, so this doubles as staleness in micros.
     pub lag_versions: u64,
     /// In fan-out rotation or ejected.
     pub healthy: bool,

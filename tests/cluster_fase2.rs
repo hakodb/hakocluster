@@ -124,14 +124,15 @@ fn lag_guard_ejects_and_readmits() {
     .unwrap();
     poll_until("meshed", || c.peer_count() == 2);
 
-    // 10 buffered writes: replica lags by exactly 10 versions.
+    // 10 buffered writes, invisible to the tailer: the replica has no
+    // "c" versions at all, so lag = the writer's write-micros (huge).
     for i in 0..10 {
         put_kv(&c, "c", &format!("k{i}"), "v");
     }
     let rep = c.refresh_health();
     assert!(rep[0].healthy);
-    assert!(!rep[1].healthy, "replica should eject at lag 10 > 5");
-    assert_eq!(rep[1].lag_versions, 10);
+    assert!(!rep[1].healthy, "replica should eject while far behind");
+    assert!(rep[1].lag_versions > 5);
     assert_eq!(c.healthy_count(), 1);
 
     // Ejected replica serves nothing: all reads land on the writer.
