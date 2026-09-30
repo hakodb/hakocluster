@@ -5,7 +5,10 @@ In-process dispatcher over N `hakodb` instances sharing identical data
 throughput), **writes route** (single-writer by design, multi-writer by
 deployment — see issue #1).
 
-Status: skeleton. The design lives in [issue #1](../../issues/1).
+Status: Fase 1 (see issue #1): `Cluster::open` + read fan-out +
+designated-writer routing + socket peering. Non-unix builds stay green:
+peering compiles out, so N > 1 fails closed and N = 1 works as a
+degenerate single-node cluster.
 Engine prerequisites (shipped in hakodb): `sync_core`, `socket_sync`,
 configurable `group_commit_interval_ms` (1..=30_000, default 5).
 
