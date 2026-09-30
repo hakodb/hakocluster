@@ -1,0 +1,85 @@
+/* Cluster FFI smoke (C consumer contract): open N=1, put/get/query,
+// promote/health/tick, close. Build (MSVC):
+//   cl /O2 ffi_smoke.c hakocluster.lib /link /OUT:ffi_smoke.exe
+// Build (gcc, unix):
+//   gcc -O2 ffi_smoke.c -L. -lhakocluster -o ffi_smoke
+// Run next to the built lib (dir/socks are created under temp).
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "hakocluster.h"
+
+#define CHECK(p)                                        \
+    do {                                                \
+        if (!(p)) {                                     \
+            fprintf(stderr, "FAIL line %d: %s\n", __LINE__, \
+                    hk_cluster_last_error() ? hk_cluster_last_error() : "(no error)"); \
+            return 1;                                   \
+        }                                               \
+    } while (0)
+
+/* JSON-escape a path (Windows backslashes must double). */
+static void json_escape(const char *in, char *out, size_t cap) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 2 < cap; i++) {
+        if (in[i] == '\\') {
+            out[j++] = '\\';
+            out[j++] = '\\';
+        } else if (in[i] == '"') {
+            out[j++] = '\\';
+            out[j++] = '"';
+        } else {
+            out[j++] = in[i];
+        }
+    }
+    out[j] = '\0';
+}
+
+int main(void) {
+    char raw[256], esc[512], socks[512], paths[1024];
+    snprintf(raw, sizeof(raw), "%s/hc-smoke",
+             getenv("TEMP") ? getenv("TEMP") : "/tmp");
+    snprintf(socks, sizeof(socks), "%s/hc-smoke-sock",
+             getenv("TEMP") ? getenv("TEMP") : "/tmp");
+    json_escape(raw, esc, sizeof(esc));
+    snprintf(paths, sizeof(paths), "[\"%s\"]", esc);
+
+    HK_Cluster *h = hk_cluster_open(paths, socks);
+    CHECK(h);
+
+    char *id = hk_cluster_put(h, "c", "k1", "{\"v\":\"one\",\"n\":7}");
+    CHECK(id);
+    assert(strcmp(id, "k1") == 0);
+    hk_cluster_string_free(id);
+
+    char *doc = hk_cluster_get(h, "c", "k1");
+    CHECK(doc);
+    assert(strstr(doc, "\"v\":\"one\"") != NULL);
+    hk_cluster_string_free(doc);
+
+    assert(hk_cluster_get(h, "c", "nope") == NULL);
+
+    char *rows = hk_cluster_query(
+        h, "{\"collection\":\"c\",\"where\":{\"field\":\"v\",\"op\":\"eq\",\"value\":\"one\"},\"limit\":10}");
+    CHECK(rows);
+    assert(strstr(rows, "k1") != NULL);
+    hk_cluster_string_free(rows);
+
+    assert(hk_cluster_epoch(h) == 0);
+    assert(hk_cluster_promote(h, 0) == 0);
+    assert(hk_cluster_promote(h, 9) == -1);
+
+    char *health = hk_cluster_refresh_health(h);
+    CHECK(health);
+    assert(strstr(health, "healthy") != NULL);
+    hk_cluster_string_free(health);
+
+    assert(hk_cluster_tick_flush(h) == 0);
+
+    hk_cluster_close(h);
+    printf("SMOKE-OK\n");
+    return 0;
+}

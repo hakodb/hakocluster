@@ -1,0 +1,138 @@
+name: release
+
+# hakocluster native-library releases for C ABI consumers (go, pascal,
+# ...). Leaner than hakodb's matrix: windows .dll + linux .so per glibc
+# family + macos .dylib, all carrying the hand-written hakocluster.h
+# (the C API is small and stable — no cbindgen step).
+#
+# Tag v* to release. Consumers pin assets by tag:
+# hakocluster-<version>-<target>.{zip,tar.gz} + flat files.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cdylib (MSVC import lib is a release artifact)
+        run: cargo build --release
+      - name: Collect assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/hakocluster.dll dist/
+          Copy-Item target/release/hakocluster.dll.lib dist/hakocluster.lib
+          Copy-Item hakocluster.h dist/
+          Copy-Item tests/ffi_smoke.c dist/
+          (Get-FileHash dist/hakocluster.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
+          (Get-FileHash dist/hakocluster.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakocluster-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          path: dist/
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # EL/Rocky/Alma 8-9 class: glibc 2.28 floor — runs on EL8 AND
+          # all newer glibc distros. Also what our own server fleet uses.
+          - image: almalinux:8
+            suffix: linux-glibc2.28-el8
+            setup: yum install -y git gcc gcc-c++ cmake perl make curl tar gzip ca-certificates
+          - image: ubuntu:22.04
+            suffix: linux-glibc2.35-ubuntu22
+            setup: apt-get update && apt-get install -y git gcc g++ cmake perl make curl tar gzip ca-certificates
+          - image: ubuntu:24.04
+            suffix: linux-glibc2.39-ubuntu24
+            setup: apt-get update && apt-get install -y git gcc g++ cmake perl make curl tar gzip ca-certificates
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup container toolchain
+        run: ${{ matrix.setup }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cdylib
+        run: cargo build --release
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/release/libhakocluster.so hakocluster.h tests/ffi_smoke.c dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakocluster-${{ github.ref_name }}-x86_64-unknown-${{ matrix.suffix }}
+          path: dist/
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cdylib
+        run: cargo build --release
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/release/libhakocluster.dylib hakocluster.h tests/ffi_smoke.c dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakocluster-${{ github.ref_name }}-aarch64-apple-darwin
+          path: dist/
+
+  publish:
+    needs: [windows-msvc, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hakocluster-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          path: assets/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: hakocluster-${{ github.ref_name }}-aarch64-apple-darwin
+          path: assets/macos
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hakocluster-${{ github.ref_name }}-x86_64-unknown-linux-*
+          path: assets/linux-matrix
+      - name: Stage flat release files and bundles
+        run: |
+          mkdir -p release pkg/win pkg/macos
+          cp assets/windows/hakocluster.dll release/hakocluster-x86_64-pc-windows-msvc.dll
+          cp assets/windows/hakocluster.lib release/hakocluster-x86_64-pc-windows-msvc.lib
+          cp assets/macos/libhakocluster.dylib release/libhakocluster-aarch64-apple-darwin.dylib
+          cp assets/windows/hakocluster.h release/hakocluster.h
+          cp assets/windows/hakocluster.dll assets/windows/hakocluster.lib assets/windows/hakocluster.h assets/windows/ffi_smoke.c pkg/win/
+          cp assets/macos/libhakocluster.dylib assets/macos/hakocluster.h assets/macos/ffi_smoke.c pkg/macos/
+          (cd pkg/win && sha256sum * > SHA256SUMS)
+          (cd pkg/macos && sha256sum * > SHA256SUMS)
+          (cd pkg/win && zip -q ../hakocluster-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip *)
+          (cd pkg/macos && tar -czf ../hakocluster-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz *)
+          mv pkg/*.zip pkg/*.tar.gz release/
+          for d in assets/linux-matrix/*/; do
+            tag=$(basename "$d" | sed "s/^hakocluster-${{ github.ref_name }}-//")
+            mkdir -p "pkg/$tag"
+            cp "$d/libhakocluster.so" "release/libhakocluster-$tag.so"
+            cp "$d/libhakocluster.so" "$d/hakocluster.h" "$d/ffi_smoke.c" "pkg/$tag/"
+            (cd "pkg/$tag" && sha256sum * > SHA256SUMS)
+            (cd pkg && tar -czf "../release/hakocluster-${{ github.ref_name }}-$tag.tar.gz" "$tag")
+          done
+          (cd release && sha256sum * > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
