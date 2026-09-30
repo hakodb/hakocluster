@@ -42,9 +42,15 @@ pub enum StaggerPolicy {
     /// Option B: per-instance intervals (e.g. co-prime-ish 5/7/11). Spreads
     /// load without start-order dependence; durability lag per instance is
     /// slightly uneven (bounded by the engine's 30s clamp). Length must
-    /// equal the instance count. (Option C — Manual + triggered flush —
-    /// is deferred: needs a flush scheduler, only if A/B prove lacking.)
+    /// equal the instance count.
     PerInstance(Vec<u64>),
+    /// Option C: Manual durability everywhere; the deployer calls
+    /// `tick_flush()` at its own cadence and the cluster flushes one
+    /// instance per call in rotation, so fsync storms never coincide.
+    /// Requires `durability_mode = Manual` (refused otherwise — an
+    /// Interval engine would flush behind the rotation's back). Maximum
+    /// control, caller-driven: no background thread, works everywhere.
+    ManualRotation,
 }
 
 impl Default for StaggerPolicy {
@@ -102,6 +108,10 @@ pub struct Cluster {
     instances: Vec<Instance>,
     /// Round-robin cursor for read fan-out.
     rr: AtomicUsize,
+    /// Designated writer index (manual failover moves it).
+    writer_index: AtomicUsize,
+    /// Option C rotation cursor for [`Cluster::tick_flush`].
+    flush_rr: AtomicUsize,
     /// Lag-guard threshold (`None` = disabled). Stored so
     /// `refresh_health` stays a pure read of instance state.
     max_lag: Option<u64>,
@@ -165,6 +175,9 @@ impl Cluster {
         // Resolve the per-instance group-commit window. StaggeredStart
         // shares one value; PerInstance overrides per index (length
         // validated up front — fail before opening anything).
+        // ManualRotation forces Manual durability (validated, not
+        // silently overridden — an Interval engine would flush behind
+        // the rotation's back, defeating the point).
         let intervals: Vec<u64> = match &cfg.stagger {
             StaggerPolicy::StaggeredStart { .. } => {
                 vec![cfg.group_commit_interval_ms; paths.len()]
@@ -179,11 +192,19 @@ impl Cluster {
                 }
                 v.clone()
             }
+            StaggerPolicy::ManualRotation => {
+                if cfg.durability_mode != hakodb::config::DurabilityMode::Manual {
+                    return Err(
+                        "ManualRotation needs durability_mode = Manual".into(),
+                    );
+                }
+                vec![cfg.group_commit_interval_ms; paths.len()]
+            }
         };
         let stagger_gap =
             match cfg.stagger {
                 StaggerPolicy::StaggeredStart { offset_ms } => offset_ms,
-                StaggerPolicy::PerInstance(_) => 0,
+                StaggerPolicy::PerInstance(_) | StaggerPolicy::ManualRotation => 0,
             };
 
         let mut dbs = Vec::with_capacity(paths.len());
@@ -241,9 +262,17 @@ impl Cluster {
                 }
                 Ok::<(), String>(())
             })?;
+            // Fail-closed both sides: only the designated writer accepts
+            // local writes (replicated ingest bypasses the flag by design,
+            // so replicas keep converging while read-only).
+            for (n, inst) in instances.iter().enumerate() {
+                inst.db.set_read_only(n != 0);
+            }
             return Ok(Self {
                 instances,
                 rr: AtomicUsize::new(0),
+                writer_index: AtomicUsize::new(0),
+                flush_rr: AtomicUsize::new(0),
                 max_lag: cfg.max_replica_lag_versions,
                 _rt: rt,
             });
@@ -253,13 +282,19 @@ impl Cluster {
         Ok(Self {
             instances: dbs
                 .into_iter()
-                .map(|db| Instance {
-                    db,
-                    reads: AtomicU64::new(0),
-                    healthy: AtomicBool::new(true),
+                .enumerate()
+                .map(|(n, db)| {
+                    db.set_read_only(n != 0);
+                    Instance {
+                        db,
+                        reads: AtomicU64::new(0),
+                        healthy: AtomicBool::new(true),
+                    }
                 })
                 .collect(),
             rr: AtomicUsize::new(0),
+            writer_index: AtomicUsize::new(0),
+            flush_rr: AtomicUsize::new(0),
             max_lag: cfg.max_replica_lag_versions,
         })
     }
@@ -269,9 +304,46 @@ impl Cluster {
         self.instances.iter().map(|i| i.db.clone()).collect()
     }
 
-    /// The designated writer (index 0). All cluster writes route here.
+    /// The designated writer. All cluster writes route here.
     pub fn writer(&self) -> &Arc<Hako> {
-        &self.instances[0].db
+        &self.instances[self.writer_index.load(Ordering::Relaxed)].db
+    }
+
+    /// Designated writer index (0 by convention; [`Self::promote`] moves it).
+    pub fn writer_index(&self) -> usize {
+        self.writer_index.load(Ordering::Relaxed)
+    }
+
+    /// Manual failover: move the designated writer to `index`. Every other
+    /// instance is set read-only (in-process, so always reachable — no
+    /// partial-failure story here). NO fencing and NO auto-detect: the
+    /// operator must fence the old writer first; two live writers diverge
+    /// under LWW (phase 4 owns leases/fencing).
+    pub fn promote(&self, index: usize) -> Result<(), String> {
+        if index >= self.instances.len() {
+            return Err(format!(
+                "promote: index {index} out of range (n={})",
+                self.instances.len()
+            ));
+        }
+        for (n, inst) in self.instances.iter().enumerate() {
+            inst.db.set_read_only(n != index);
+        }
+        self.writer_index.store(index, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Option C rotation tick: flush ONE instance (round-robin) so its
+    /// buffered Manual writes reach the WAL file (and the socket tailer).
+    /// The deployer calls this at its own flush cadence; fsync storms
+    /// never coincide because only one instance flushes per tick.
+    pub fn tick_flush(&self) -> Result<(), String> {
+        let n = self.instances.len();
+        let i = self.flush_rr.fetch_add(1, Ordering::Relaxed) % n;
+        self.instances[i]
+            .db
+            .flush()
+            .map_err(|e| format!("tick_flush instance {i}: {e}"))
     }
 
     /// Member count.
@@ -301,10 +373,11 @@ impl Cluster {
     /// reported). Explicit call — no background thread in phase 2; drive
     /// it from the deployer's own tick.
     pub fn refresh_health(&self) -> Vec<ReplicaHealth> {
-        let base = self.instances[0].db.get_version_map();
+        let w = self.writer_index.load(Ordering::Relaxed);
+        let base = self.instances[w].db.get_version_map();
         let mut out = Vec::with_capacity(self.instances.len());
         for (n, inst) in self.instances.iter().enumerate() {
-            let lag = if n == 0 {
+            let lag = if n == w {
                 0
             } else {
                 let m = inst.db.get_version_map();
@@ -313,10 +386,10 @@ impl Cluster {
                     .max()
                     .unwrap_or(0)
             };
-            let healthy = match (n, self.max_lag) {
-                (0, _) => true,
-                (_, None) => true,
-                (_, Some(max)) => {
+            let healthy = match (n == w, self.max_lag) {
+                (true, _) => true,
+                (false, None) => true,
+                (false, Some(max)) => {
                     let cur = inst.healthy.load(Ordering::Relaxed);
                     // ponytail: hysteresis in one expression — eject past
                     // max, re-admit at/below half, otherwise hold state.
