@@ -28,6 +28,7 @@ fn cfg(sock: &std::path::Path) -> ClusterConfig {
         durability_mode: DurabilityMode::Interval,
         group_commit_interval_ms: 5,
         sock_dir: sock.to_path_buf(),
+        ..ClusterConfig::default()
     }
 }
 

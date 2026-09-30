@@ -1,11 +1,14 @@
-//! hakocluster: dispatcher over N hakodb instances (Fase 1).
+//! hakocluster: dispatcher over N hakodb instances (Fase 2).
 //!
-//! Full design: hakodb/hakocluster#1. Fase 1 scope only:
+//! Full design: hakodb/hakocluster#1.
 //! - `Cluster::open[_with_config]` — one `Hako` per data dir + full-mesh
 //!   `socket_sync` peering (one connection per pair, `i` dials `j > i`).
-//! - Reads (`get`/`query`) fan out round-robin across all instances.
+//! - Reads (`get`/`query`) fan out round-robin across healthy instances.
 //! - Writes (`put`/`put_owned`/`delete`) route to the designated writer,
 //!   `instances[0]` by convention.
+//! - Fase 2 adds: stagger policy (same interval + spaced opens, or
+//!   per-instance intervals) and a lag guard (eject replicas trailing the
+//!   writer by more than `max_replica_lag_versions`, re-admit at half).
 //! - Replicated writes join each instance's normal write/flush queue (that
 //!   is `SocketSync`'s own behavior); the cluster adds no flush paths.
 //!
@@ -16,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use hakodb::config::HakoConfig;
@@ -27,15 +30,45 @@ use hakodb::query::query::Query;
 #[cfg(unix)]
 use hakodb::socket_sync::SocketSync;
 
-/// Fase 1 cluster configuration.
+/// Flush-cadence stagger policy (issue #1: flush cadence is the ONLY
+/// knob — never skip the queue, no direct-flush paths).
+#[derive(Debug, Clone)]
+pub enum StaggerPolicy {
+    /// Option A (default): same interval everywhere; instance opens spaced
+    /// by `offset_ms` so group-commit phases don't coincide. The engine's
+    /// `last_sync` starts at WAL open, so spaced opens = phased flushes.
+    /// Zero coordination protocol.
+    StaggeredStart { offset_ms: u64 },
+    /// Option B: per-instance intervals (e.g. co-prime-ish 5/7/11). Spreads
+    /// load without start-order dependence; durability lag per instance is
+    /// slightly uneven (bounded by the engine's 30s clamp). Length must
+    /// equal the instance count. (Option C — Manual + triggered flush —
+    /// is deferred: needs a flush scheduler, only if A/B prove lacking.)
+    PerInstance(Vec<u64>),
+}
+
+impl Default for StaggerPolicy {
+    fn default() -> Self {
+        Self::StaggeredStart { offset_ms: 1 }
+    }
+}
+
+/// Fase 2 cluster configuration.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     /// Durability for every instance (tests use Interval: the socket tailer
     /// reads the WAL file, so only flushed bytes replicate live).
     pub durability_mode: hakodb::config::DurabilityMode,
-    /// Per-instance group-commit window (staggering is phase 2; Fase 1
-    /// uses the same value everywhere).
+    /// Group-commit window used when `stagger` doesn't override it
+    /// (StaggeredStart and the default).
     pub group_commit_interval_ms: u64,
+    /// Flush-cadence stagger across instances (default: 1ms-spaced starts).
+    pub stagger: StaggerPolicy,
+    /// Lag guard: eject a replica from fan-out when it trails the writer
+    /// by more than this many versions (version-map delta); re-admit at
+    /// half the threshold (hysteresis against flapping). `None` disables.
+    /// The writer (index 0) never ejects.
+    pub max_replica_lag_versions: Option<u64>,
     /// Directory holding one `instance-{i}.sock` per member.
     pub sock_dir: PathBuf,
 }
@@ -45,6 +78,8 @@ impl Default for ClusterConfig {
         Self {
             durability_mode: hakodb::config::DurabilityMode::Interval,
             group_commit_interval_ms: 5,
+            stagger: StaggerPolicy::StaggeredStart { offset_ms: 1 },
+            max_replica_lag_versions: Some(10_000),
             sock_dir: PathBuf::from("socks"),
         }
     }
@@ -64,6 +99,9 @@ pub struct Cluster {
     instances: Vec<Instance>,
     /// Round-robin cursor for read fan-out.
     rr: AtomicUsize,
+    /// Lag-guard threshold (`None` = disabled). Stored so
+    /// `refresh_health` stays a pure read of instance state.
+    max_lag: Option<u64>,
     /// Held so the socket tasks outlive `open` (unix only).
     #[cfg(unix)]
     _rt: tokio::runtime::Runtime,
@@ -73,8 +111,21 @@ struct Instance {
     db: Arc<Hako>,
     /// Reads served (fan-out accounting; phase 2 least-busy input).
     reads: AtomicU64,
+    /// False = ejected by the lag guard, skipped by fan-out.
+    healthy: AtomicBool,
     #[cfg(unix)]
     _sync: SocketSync,
+}
+
+/// Per-instance health from [`Cluster::refresh_health`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaHealth {
+    /// Instance index (0 = designated writer, always healthy).
+    pub index: usize,
+    /// Max version-map delta vs the writer (0 = converged).
+    pub lag_versions: u64,
+    /// In fan-out rotation or ejected.
+    pub healthy: bool,
 }
 
 impl Cluster {
@@ -107,11 +158,40 @@ impl Cluster {
             );
         }
 
+        // Resolve the per-instance group-commit window. StaggeredStart
+        // shares one value; PerInstance overrides per index (length
+        // validated up front — fail before opening anything).
+        let intervals: Vec<u64> = match &cfg.stagger {
+            StaggerPolicy::StaggeredStart { .. } => {
+                vec![cfg.group_commit_interval_ms; paths.len()]
+            }
+            StaggerPolicy::PerInstance(v) => {
+                if v.len() != paths.len() {
+                    return Err(format!(
+                        "PerInstance needs one interval per path (got {} for {})",
+                        v.len(),
+                        paths.len()
+                    ));
+                }
+                v.clone()
+            }
+        };
+        let stagger_gap =
+            match cfg.stagger {
+                StaggerPolicy::StaggeredStart { offset_ms } => offset_ms,
+                StaggerPolicy::PerInstance(_) => 0,
+            };
+
         let mut dbs = Vec::with_capacity(paths.len());
-        for p in paths {
+        for (n, p) in paths.iter().enumerate() {
+            if n > 0 && stagger_gap > 0 {
+                // Phase the group-commit windows: each WAL's last_sync
+                // starts at its own open, so spaced opens = phased flushes.
+                std::thread::sleep(std::time::Duration::from_millis(stagger_gap));
+            }
             let mut hc = HakoConfig::default();
             hc.durability_mode = cfg.durability_mode;
-            hc.group_commit_interval_ms = cfg.group_commit_interval_ms;
+            hc.group_commit_interval_ms = intervals[n];
             dbs.push(Arc::new(
                 Hako::open(p, hc).map_err(|e| format!("open {p}: {e}"))?,
             ));
@@ -135,6 +215,7 @@ impl Cluster {
                 instances.push(Instance {
                     db: db.clone(),
                     reads: AtomicU64::new(0),
+                    healthy: AtomicBool::new(true),
                     _sync: SocketSync::new(db.clone(), vec![]),
                 });
             }
@@ -159,6 +240,7 @@ impl Cluster {
             return Ok(Self {
                 instances,
                 rr: AtomicUsize::new(0),
+                max_lag: cfg.max_replica_lag_versions,
                 _rt: rt,
             });
         }
@@ -170,9 +252,11 @@ impl Cluster {
                 .map(|db| Instance {
                     db,
                     reads: AtomicU64::new(0),
+                    healthy: AtomicBool::new(true),
                 })
                 .collect(),
             rr: AtomicUsize::new(0),
+            max_lag: cfg.max_replica_lag_versions,
         })
     }
 
@@ -207,13 +291,73 @@ impl Cluster {
         return 0;
     }
 
-    /// Next read replica, round-robin.
+    /// Recompute replica lag vs the writer and apply the guard: eject past
+    /// `max_replica_lag_versions`, re-admit at half (hysteresis). The
+    /// writer (index 0) never ejects. `None` disables ejection (lag still
+    /// reported). Explicit call — no background thread in phase 2; drive
+    /// it from the deployer's own tick.
+    pub fn refresh_health(&self) -> Vec<ReplicaHealth> {
+        let base = self.instances[0].db.get_version_map();
+        let mut out = Vec::with_capacity(self.instances.len());
+        for (n, inst) in self.instances.iter().enumerate() {
+            let lag = if n == 0 {
+                0
+            } else {
+                let m = inst.db.get_version_map();
+                base.iter()
+                    .map(|(col, wv)| wv.saturating_sub(*m.get(col).unwrap_or(&0)) as u64)
+                    .max()
+                    .unwrap_or(0)
+            };
+            let healthy = match (n, self.max_lag) {
+                (0, _) => true,
+                (_, None) => true,
+                (_, Some(max)) => {
+                    let cur = inst.healthy.load(Ordering::Relaxed);
+                    // ponytail: hysteresis in one expression — eject past
+                    // max, re-admit at/below half, otherwise hold state.
+                    if lag > max {
+                        false
+                    } else if lag <= max / 2 {
+                        true
+                    } else {
+                        cur
+                    }
+                }
+            };
+            inst.healthy.store(healthy, Ordering::Relaxed);
+            out.push(ReplicaHealth {
+                index: n,
+                lag_versions: lag,
+                healthy,
+            });
+        }
+        out
+    }
+
+    /// Instances currently in fan-out rotation.
+    pub fn healthy_count(&self) -> usize {
+        self.instances
+            .iter()
+            .filter(|i| i.healthy.load(Ordering::Relaxed))
+            .count()
+    }
+
+    /// Next read replica, round-robin over healthy instances (ejected ones
+    /// are skipped; the writer always qualifies).
     fn pick(&self) -> &Instance {
         let n = self.instances.len();
         // ponytail: wrapping_add, not checked math — a counter that runs
         // for centuries is the only overflow story, and modulo is safe.
-        let i = self.rr.fetch_add(1, Ordering::Relaxed) % n;
-        &self.instances[i]
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        for k in 0..n {
+            let inst = &self.instances[(start + k) % n];
+            if inst.healthy.load(Ordering::Relaxed) {
+                return inst;
+            }
+        }
+        // Unreachable (writer never ejects) — fail closed to the writer.
+        &self.instances[0]
     }
 
     // --- Write path: designated writer only (issue #1, phase 1). ---
