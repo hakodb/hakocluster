@@ -5,11 +5,10 @@ In-process dispatcher over N `hakodb` instances sharing identical data
 throughput), **writes route** (single-writer by design, multi-writer by
 deployment — see issue #1).
 
-Status: Fase 3 (see issue #1): read-only enforcement (engine flag,
-replicas fail closed, ingest unaffected) + manual failover
-(`promote`) + Option C (`ManualRotation` + caller-driven `tick_flush`;
-assessed: Manual flush of 2000 docs is 2ms Linux / 48ms Windows —
-rotation at any sane cadence keeps up). Non-unix builds stay green:
+Status: Fase 4 (see issue #1): promotion epochs + audit log
+(`promote` returns the epoch, idempotent re-promote; fence stays the
+read-only flags). Lease granting / auto-failover deliberately NOT here:
+needs balancer HA first (see hakobalancer#2). Non-unix builds stay green:
 peering compiles out, so N > 1 fails closed and N = 1 works as a
 degenerate single-node cluster.
 Engine prerequisites (shipped in hakodb): `sync_core`, `socket_sync`,
