@@ -143,7 +143,6 @@ impl Cluster {
                     inst._sync
                         .serve(sock.to_string_lossy().as_ref())
                         .map_err(|e| format!("serve {}: {e}", sock.display()))?;
-                    Ok::<(), String>(())
                 }
                 for i in 0..instances.len() {
                     for j in (i + 1)..instances.len() {
