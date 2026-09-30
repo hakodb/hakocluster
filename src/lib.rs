@@ -128,24 +128,35 @@ impl Cluster {
                 .collect();
             // Serve all, then dial the mesh (one connection per pair:
             // i dials j > i; traffic is bidirectional per connection).
+            // ponytail: serve() needs a reactor context (UnixListener::
+            // from_std), so serve+dial both run inside one block_on.
             let mut instances = Vec::with_capacity(dbs.len());
-            for (db, sock) in dbs.into_iter().zip(socks.iter()) {
-                let sync = SocketSync::new(db.clone(), vec![]);
-                sync.serve(sock.to_string_lossy().as_ref())
-                    .map_err(|e| format!("serve {}: {e}", sock.display()))?;
+            for db in &dbs {
                 instances.push(Instance {
-                    db,
+                    db: db.clone(),
                     reads: AtomicU64::new(0),
-                    _sync: sync,
+                    _sync: SocketSync::new(db.clone(), vec![]),
                 });
             }
-            for i in 0..instances.len() {
-                for j in (i + 1)..instances.len() {
-                    let path = socks[j].to_string_lossy().into_owned();
-                    rt.block_on(instances[i]._sync.dial(&path))
-                        .map_err(|e| format!("dial {}: {e}", socks[j].display()))?;
+            rt.block_on(async {
+                for (inst, sock) in instances.iter().zip(socks.iter()) {
+                    inst._sync
+                        .serve(sock.to_string_lossy().as_ref())
+                        .map_err(|e| format!("serve {}: {e}", sock.display()))?;
+                    Ok::<(), String>(())
                 }
-            }
+                for i in 0..instances.len() {
+                    for j in (i + 1)..instances.len() {
+                        let path = socks[j].to_string_lossy().into_owned();
+                        instances[i]
+                            ._sync
+                            .dial(&path)
+                            .await
+                            .map_err(|e| format!("dial {}: {e}", socks[j].display()))?;
+                    }
+                }
+                Ok::<(), String>(())
+            })?;
             return Ok(Self {
                 instances,
                 rr: AtomicUsize::new(0),
