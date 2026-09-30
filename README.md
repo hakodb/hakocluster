@@ -5,8 +5,9 @@ In-process dispatcher over N `hakodb` instances sharing identical data
 throughput), **writes route** (single-writer by design, multi-writer by
 deployment — see issue #1).
 
-Status: Fase 1 (see issue #1): `Cluster::open` + read fan-out +
-designated-writer routing + socket peering. Non-unix builds stay green:
+Status: Fase 2 (see issue #1): stagger policy (same interval +
+spaced opens, or per-instance intervals) + lag guard (eject past
+`max_replica_lag_versions`, re-admit at half). Non-unix builds stay green:
 peering compiles out, so N > 1 fails closed and N = 1 works as a
 degenerate single-node cluster.
 Engine prerequisites (shipped in hakodb): `sync_core`, `socket_sync`,
