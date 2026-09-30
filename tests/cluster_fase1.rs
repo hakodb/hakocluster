@@ -126,7 +126,8 @@ fn two_instances_peer_and_replica_converges() {
     )
     .unwrap();
     assert_eq!(c.instance_count(), 2);
-    assert_eq!(c.peer_count(), 1);
+    // One connection per pair, counted on both sides (dialer + accepter).
+    poll_until("mesh peered", || c.peer_count() == 2);
 
     put_kv(&c, "c", "k1", "one");
     c.writer().flush().unwrap();
