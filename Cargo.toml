@@ -6,8 +6,14 @@ description = "In-process dispatcher over N hakodb instances: reads fan out, wri
 license = "MIT"
 repository = "https://github.com/hakodb/hakocluster"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 # ponytail: only the socket-sync lane (tokio). net-sync/cloud-sync pull
 # mdns/rustls/tungstenite — unneeded here, and each is minutes of compile.
 hakodb = { version = "0.9", default-features = false, features = ["socket-sync"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# JSON boundary for the C ABI (go/pascal consumers): docs and queries
+# cross as UTF-8 strings, never as structs.
+serde_json = "1"

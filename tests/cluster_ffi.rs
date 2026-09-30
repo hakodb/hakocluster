@@ -11,14 +11,14 @@ fn cs(s: &str) -> *const c_char {
     CString::new(s).unwrap().into_raw() as *const c_char
 }
 
-/// Take ownership of a returned string (frees via hk_string_free after
-/// copying out — mirrors what a C consumer does).
+/// Take ownership of a returned string (frees via hk_cluster_string_free
+/// after copying out — mirrors what a C consumer does).
 unsafe fn take(p: *mut c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
     let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-    hk_string_free(p);
+    hk_cluster_string_free(p);
     Some(s)
 }
 

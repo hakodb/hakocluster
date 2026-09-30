@@ -16,6 +16,8 @@
 //! is unavailable — `open` with N > 1 fails closed; N = 1 works as a
 //! degenerate single-node cluster.
 
+pub mod ffi;
+
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
