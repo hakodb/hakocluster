@@ -110,6 +110,10 @@ pub struct Cluster {
     rr: AtomicUsize,
     /// Designated writer index (manual failover moves it).
     writer_index: AtomicUsize,
+    /// Promotion epoch (1-based; 0 = initial writer, never promoted).
+    epoch: AtomicU64,
+    /// Append-only promotion audit (promotions are rare; Vec is fine).
+    promotions: std::sync::Mutex<Vec<Promotion>>,
     /// Option C rotation cursor for [`Cluster::tick_flush`].
     flush_rr: AtomicUsize,
     /// Lag-guard threshold (`None` = disabled). Stored so
@@ -128,6 +132,19 @@ struct Instance {
     healthy: AtomicBool,
     #[cfg(unix)]
     _sync: SocketSync,
+}
+
+/// One promotion record: which epoch moved the writer where, and when.
+/// Operators use epochs to order promotions (a higher epoch supersedes);
+/// the actual fence is the read-only flags [`Cluster::promote`] sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Promotion {
+    /// 1-based promotion counter (0 = no promotion yet, initial writer).
+    pub epoch: u64,
+    /// New designated writer index.
+    pub writer: usize,
+    /// Wall millis at promotion (operator audit only, never a lease).
+    pub at_ms: u64,
 }
 
 /// Per-instance health from [`Cluster::refresh_health`].
@@ -272,6 +289,8 @@ impl Cluster {
                 instances,
                 rr: AtomicUsize::new(0),
                 writer_index: AtomicUsize::new(0),
+                epoch: AtomicU64::new(0),
+                promotions: std::sync::Mutex::new(Vec::new()),
                 flush_rr: AtomicUsize::new(0),
                 max_lag: cfg.max_replica_lag_versions,
                 _rt: rt,
@@ -294,6 +313,8 @@ impl Cluster {
                 .collect(),
             rr: AtomicUsize::new(0),
             writer_index: AtomicUsize::new(0),
+            epoch: AtomicU64::new(0),
+            promotions: std::sync::Mutex::new(Vec::new()),
             flush_rr: AtomicUsize::new(0),
             max_lag: cfg.max_replica_lag_versions,
         })
@@ -314,23 +335,48 @@ impl Cluster {
         self.writer_index.load(Ordering::Relaxed)
     }
 
-    /// Manual failover: move the designated writer to `index`. Every other
+    /// Manual failover: move the designated writer to `index`. Returns
+    /// the promotion epoch (1-based; re-promoting the current writer is
+    /// a no-op returning the current epoch without logging). Every other
     /// instance is set read-only (in-process, so always reachable — no
     /// partial-failure story here). NO fencing and NO auto-detect: the
     /// operator must fence the old writer first; two live writers diverge
-    /// under LWW (phase 4 owns leases/fencing).
-    pub fn promote(&self, index: usize) -> Result<(), String> {
+    /// under LWW. Lease granting (auto-failover) needs balancer HA first
+    /// and lives there, not here (see hakobalancer).
+    pub fn promote(&self, index: usize) -> Result<u64, String> {
         if index >= self.instances.len() {
             return Err(format!(
                 "promote: index {index} out of range (n={})",
                 self.instances.len()
             ));
         }
+        if index == self.writer_index.load(Ordering::Relaxed) {
+            return Ok(self.epoch.load(Ordering::Relaxed));
+        }
         for (n, inst) in self.instances.iter().enumerate() {
             inst.db.set_read_only(n != index);
         }
         self.writer_index.store(index, Ordering::Relaxed);
-        Ok(())
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.promotions
+            .lock()
+            .unwrap()
+            .push(Promotion { epoch, writer: index, at_ms });
+        Ok(epoch)
+    }
+
+    /// Current promotion epoch (0 = initial writer, never promoted).
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Promotion audit log, oldest first.
+    pub fn promotion_log(&self) -> Vec<Promotion> {
+        self.promotions.lock().unwrap().clone()
     }
 
     /// Option C rotation tick: flush ONE instance (round-robin) so its
