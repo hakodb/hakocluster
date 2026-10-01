@@ -399,6 +399,24 @@ impl Cluster {
         self.instances.len()
     }
 
+    /// Next read replica index, round-robin over healthy instances
+    /// (ejected ones skipped; the writer always qualifies). Driver
+    /// entry-point for fan-out without reimplementing picking.
+    pub fn read_index(&self) -> usize {
+        let n = self.instances.len();
+        // ponytail: wrapping_add, not checked math — a counter that runs
+        // for centuries is the only overflow story, and modulo is safe.
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        for k in 0..n {
+            let i = (start + k) % n;
+            if self.instances[i].healthy.load(Ordering::Relaxed) {
+                return i;
+            }
+        }
+        // Unreachable (writer never ejects) — fail closed to the writer.
+        self.writer_index.load(Ordering::Relaxed)
+    }
+
     /// Reads served per instance (fan-out accounting).
     pub fn read_counts(&self) -> Vec<u64> {
         self.instances
@@ -417,7 +435,7 @@ impl Cluster {
 
     /// Recompute replica lag vs the writer and apply the guard: eject past
     /// `max_replica_lag_versions`, re-admit at half (hysteresis). The
-    /// writer (index 0) never ejects. `None` disables ejection (lag still
+    /// designated writer never ejects. `None` disables ejection (lag still
     /// reported). Explicit call — no background thread in phase 2; drive
     /// it from the deployer's own tick.
     pub fn refresh_health(&self) -> Vec<ReplicaHealth> {
@@ -471,18 +489,7 @@ impl Cluster {
     /// Next read replica, round-robin over healthy instances (ejected ones
     /// are skipped; the writer always qualifies).
     fn pick(&self) -> &Instance {
-        let n = self.instances.len();
-        // ponytail: wrapping_add, not checked math — a counter that runs
-        // for centuries is the only overflow story, and modulo is safe.
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        for k in 0..n {
-            let inst = &self.instances[(start + k) % n];
-            if inst.healthy.load(Ordering::Relaxed) {
-                return inst;
-            }
-        }
-        // Unreachable (writer never ejects) — fail closed to the writer.
-        &self.instances[0]
+        &self.instances[self.read_index()]
     }
 
     // --- Write path: designated writer only (issue #1, phase 1). ---

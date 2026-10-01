@@ -176,3 +176,29 @@ fn fanout_spreads_reads_across_replicas() {
     // Round-robin: 15/15.
     assert_eq!(c.read_counts(), vec![15, 15]);
 }
+
+#[test]
+fn read_index_round_robins_single_node() {
+    let dir = tmp("ri");
+    let sock = tmp("ri-sock");
+    let c =
+        Cluster::open_with_config(&[dir.to_str().unwrap()], cfg(&sock)).unwrap();
+    assert_eq!((c.read_index(), c.read_index()), (0, 0));
+}
+
+#[cfg(unix)]
+#[test]
+fn read_index_alternates_two_nodes() {
+    let a = tmp("ri-a");
+    let b = tmp("ri-b");
+    let sock = tmp("ri-sock");
+    let c = Cluster::open_with_config(
+        &[a.to_str().unwrap(), b.to_str().unwrap()],
+        cfg(&sock),
+    )
+    .unwrap();
+    assert_eq!(
+        (c.read_index(), c.read_index(), c.read_index(), c.read_index()),
+        (0, 1, 0, 1)
+    );
+}

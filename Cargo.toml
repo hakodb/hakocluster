@@ -1,6 +1,6 @@
 [package]
 name = "hakocluster"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "In-process dispatcher over N hakodb instances: reads fan out, writes route, socket_sync keeps replicas identical"
 license = "MIT"
