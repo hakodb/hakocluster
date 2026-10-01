@@ -202,3 +202,34 @@ fn read_index_alternates_two_nodes() {
         (0, 1, 0, 1)
     );
 }
+
+/// Opening inside a running runtime must reuse it (nesting runtimes
+/// panics) — the backend-server case (#[tokio::main] + driver open).
+#[cfg(unix)]
+#[tokio::test]
+async fn open_inside_runtime_reuses_it() {
+    let a = tmp("rt-a");
+    let b = tmp("rt-b");
+    let sock = tmp("rt-sock");
+    let c = Cluster::open_with_config(
+        &[a.to_str().unwrap(), b.to_str().unwrap()],
+        cfg(&sock),
+    )
+    .unwrap();
+    assert_eq!(c.instance_count(), 2);
+    let mut d = hakodb::document::hako_doc::HakoDoc::default();
+    d.insert(
+        "v",
+        hakodb::document::value::Value::String("one".into()),
+    );
+    c.put_owned("c", "k1", d).unwrap();
+    c.writer().flush().unwrap();
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(15) {
+        if c.instances()[1].get("c", "k1").ok().flatten().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(c.instances()[1].get("c", "k1").unwrap().is_some());
+}

@@ -121,9 +121,19 @@ pub struct Cluster {
     /// Lag-guard threshold (`None` = disabled). Stored so
     /// `refresh_health` stays a pure read of instance state.
     max_lag: Option<u64>,
-    /// Held so the socket tasks outlive `open` (unix only).
+    /// Runtime hosting the socket tasks (unix only): owned when `open`
+    /// runs outside any runtime (plain sync callers, tests), shared when
+    /// called inside one (servers like hakobackend run `#[tokio::main]` —
+    /// nesting runtimes panics, and blocking is illegal there, so dials
+    /// are spawned instead of awaited; peering converges asynchronously).
     #[cfg(unix)]
-    _rt: tokio::runtime::Runtime,
+    _rt: Rt,
+}
+
+#[cfg(unix)]
+enum Rt {
+    Owned(tokio::runtime::Runtime),
+    Shared(tokio::runtime::Handle),
 }
 
 struct Instance {
@@ -243,8 +253,13 @@ impl Cluster {
 
         #[cfg(unix)]
         {
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| format!("tokio runtime: {e}"))?;
+            let rt = match tokio::runtime::Handle::try_current() {
+                Ok(h) => Rt::Shared(h),
+                Err(_) => Rt::Owned(
+                    tokio::runtime::Runtime::new()
+                        .map_err(|e| format!("tokio runtime: {e}"))?,
+                ),
+            };
             std::fs::create_dir_all(&cfg.sock_dir)
                 .map_err(|e| format!("sock_dir: {e}"))?;
             let socks: Vec<PathBuf> = (0..dbs.len())
@@ -263,7 +278,12 @@ impl Cluster {
                     _sync: SocketSync::new(db.clone(), vec![]),
                 });
             }
-            rt.block_on(async {
+            // Mesh setup as one async block: serve() needs a reactor
+            // context (UnixListener::from_std) in both cases. Owned
+            // runtime blocks on it; shared handle spawns + awaits it
+            // (blocking or spawning-then-blocking are both illegal inside
+            // a running runtime — this shape is legal in both callers).
+            let mesh = async {
                 for (inst, sock) in instances.iter().zip(socks.iter()) {
                     inst._sync
                         .serve(sock.to_string_lossy().as_ref())
@@ -280,7 +300,14 @@ impl Cluster {
                     }
                 }
                 Ok::<(), String>(())
-            })?;
+            };
+            match &rt {
+                Rt::Owned(r) => r.block_on(mesh)?,
+                Rt::Shared(h) => h
+                    .spawn(mesh)
+                    .await
+                    .map_err(|e| format!("mesh task: {e}"))??,
+            }
             // Fail-closed both sides: only the designated writer accepts
             // local writes (replicated ingest bypasses the flag by design,
             // so replicas keep converging while read-only).
