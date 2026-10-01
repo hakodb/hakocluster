@@ -417,6 +417,15 @@ impl Cluster {
         self.writer_index.load(Ordering::Relaxed)
     }
 
+    /// Record a served read for fan-out accounting (drivers that pick
+    /// via read_index() and serve through their own handles call this;
+    /// Cluster::get/query do it internally). Out-of-range is a no-op.
+    pub fn note_read(&self, index: usize) {
+        if let Some(inst) = self.instances.get(index) {
+            inst.reads.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Reads served per instance (fan-out accounting).
     pub fn read_counts(&self) -> Vec<u64> {
         self.instances
