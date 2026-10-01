@@ -143,7 +143,7 @@ struct Instance {
     /// False = ejected by the lag guard, skipped by fan-out.
     healthy: AtomicBool,
     #[cfg(unix)]
-    _sync: SocketSync,
+    _sync: std::sync::Arc<SocketSync>,
 }
 
 /// One promotion record: which epoch moved the writer where, and when.
@@ -268,51 +268,80 @@ impl Cluster {
             // Serve all, then dial the mesh (one connection per pair:
             // i dials j > i; traffic is bidirectional per connection).
             // ponytail: serve() needs a reactor context (UnixListener::
-            // from_std), so serve+dial both run inside one block_on.
+            // from_std) — see the mesh block below for how each runtime
+            // shape provides it.
             let mut instances = Vec::with_capacity(dbs.len());
             for db in &dbs {
                 instances.push(Instance {
                     db: db.clone(),
                     reads: AtomicU64::new(0),
                     healthy: AtomicBool::new(true),
-                    _sync: SocketSync::new(db.clone(), vec![]),
+                    _sync: std::sync::Arc::new(SocketSync::new(db.clone(), vec![])),
                 });
             }
-            // Mesh setup as one async block: serve() needs a reactor
-            // context (UnixListener::from_std) in both cases. Owned
-            // runtime blocks on it; shared handle spawns + awaits it
-            // (blocking or spawning-then-blocking are both illegal inside
-            // a running runtime — this shape is legal in both callers).
-            let mesh = async {
-                for (inst, sock) in instances.iter().zip(socks.iter()) {
-                    inst._sync
-                        .serve(sock.to_string_lossy().as_ref())
-                        .map_err(|e| format!("serve {}: {e}", sock.display()))?;
+            // Fail-closed both sides (synchronous, deterministic from
+            // boot): only the designated writer accepts local writes.
+            // Replicated ingest bypasses the flag by design, so replicas
+            // keep converging while read-only.
+            for (n, inst) in instances.iter().enumerate() {
+                inst.db.set_read_only(n != 0);
+            }
+            // Mesh setup: serve needs a reactor context
+            // (UnixListener::from_std) in both cases.
+            let syncs: Vec<(std::sync::Arc<SocketSync>, PathBuf)> = instances
+                .iter()
+                .zip(socks.iter())
+                .map(|(inst, sock)| (inst._sync.clone(), sock.clone()))
+                .collect();
+            let mesh = async move {
+                for (sync, sock) in &syncs {
+                    sync.serve(sock.to_string_lossy().as_ref()).map_err(|e| {
+                        format!("serve {}: {e}", sock.display())
+                    })?;
                 }
-                for i in 0..instances.len() {
-                    for j in (i + 1)..instances.len() {
-                        let path = socks[j].to_string_lossy().into_owned();
-                        instances[i]
-                            ._sync
-                            .dial(&path)
-                            .await
-                            .map_err(|e| format!("dial {}: {e}", socks[j].display()))?;
+                for i in 0..syncs.len() {
+                    for j in (i + 1)..syncs.len() {
+                        let path = syncs[j].1.to_string_lossy().into_owned();
+                        // ponytail: short retry for boot-order races (the
+                        // other side serves a moment later). Peer RESTART
+                        // healing is out of phase-1 scope (no re-meshing);
+                        // the backend driver layer retries for that.
+                        let mut last = String::new();
+                        let mut ok = false;
+                        for _ in 0..5 {
+                            match syncs[i].0.dial(&path).await {
+                                Ok(_) => {
+                                    ok = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    last = e.to_string();
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_secs(1),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        if !ok {
+                            return Err(format!(
+                                "dial {}: {last} (mesh incomplete)",
+                                syncs[j].1.display()
+                            ));
+                        }
                     }
                 }
                 Ok::<(), String>(())
             };
             match &rt {
                 Rt::Owned(r) => r.block_on(mesh)?,
-                Rt::Shared(h) => h
-                    .spawn(mesh)
-                    .await
-                    .map_err(|e| format!("mesh task: {e}"))??,
-            }
-            // Fail-closed both sides: only the designated writer accepts
-            // local writes (replicated ingest bypasses the flag by design,
-            // so replicas keep converging while read-only).
-            for (n, inst) in instances.iter().enumerate() {
-                inst.db.set_read_only(n != 0);
+                Rt::Shared(h) => {
+                    h.spawn(async move {
+                        if let Err(e) = mesh.await {
+                            eprintln!("[hakocluster] mesh failed: {e}");
+                        }
+                    });
+                }
             }
             return Ok(Self {
                 instances,
