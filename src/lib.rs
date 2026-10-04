@@ -18,6 +18,7 @@
 
 pub mod ffi;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -607,5 +608,126 @@ impl Drop for Cluster {
             i._sync.stop();
         }
         // Runtime drop aborts the accept/tail tasks.
+    }
+}
+
+// --- Multidatabase registry (hakocluster#6): one process, N named
+// databases. Fixed at open (reload re-opens; no runtime membership
+// mutation). Each database is a full `Cluster` with its own mesh —
+// NEVER meshed across databases (converging divergent data is
+// corruption shaped as operation, see #2). Unknown names are ALWAYS
+// 404/None, even opt-in auto-create does not exist here: storage may
+// be fresh-empty on open (as today), but the NAME must be declared.
+
+/// Database name gate: same discipline as collection segments
+/// (`[A-Za-z0-9_-]`, 1–128, no `__` prefix). The name becomes a sock
+/// subdir, so traversal shapes are refused here, not downstream.
+pub fn valid_db_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        && !s.starts_with("__")
+}
+
+/// One named database declaration for [`Databases::open`].
+#[derive(Debug, Clone)]
+pub struct DbSpec {
+    pub name: String,
+    pub paths: Vec<String>,
+    pub config: ClusterConfig,
+}
+
+/// N named databases in one process. Selection is by exact name;
+/// there is no default database (a silent default routes writes
+/// somewhere the operator did not choose).
+pub struct Databases {
+    dbs: HashMap<String, Arc<Cluster>>,
+    /// Declaration order (deterministic listing).
+    order: Vec<String>,
+    /// The single shared runtime, present only when this registry
+    /// minted it (FFI sync callers). Server-embedded use shares the
+    /// server runtime instead — N databases must never mean N runtimes.
+    #[cfg(unix)]
+    _rt: Option<tokio::runtime::Runtime>,
+}
+
+impl Databases {
+    /// Open every declared database. Each gets `sock_root/{name}` as
+    /// its mesh dir (doubles as the mesh boundary: no cross-database
+    /// peering is representable). Fail-closed: bad/duplicate/empty
+    /// declarations and any per-db open failure refuse the whole
+    /// registry (already-opened siblings drop cleanly via `Drop`).
+    pub fn open(specs: Vec<DbSpec>, sock_root: PathBuf) -> Result<Self, String> {
+        if specs.is_empty() {
+            return Err("need ≥1 database".into());
+        }
+        let mut seen = HashSet::new();
+        for s in &specs {
+            if !valid_db_name(&s.name) {
+                return Err(format!("bad database name `{}`", s.name));
+            }
+            if !seen.insert(s.name.clone()) {
+                return Err(format!("duplicate database `{}`", s.name));
+            }
+            if s.paths.is_empty() {
+                return Err(format!("database `{}` needs ≥1 path", s.name));
+            }
+        }
+        // ponytail: open inside the shared context when we mint the
+        // runtime, so every Cluster takes Shared (one runtime total).
+        // No Cluster API change: try_current succeeds inside block_on.
+        #[cfg(unix)]
+        {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let (dbs, order) = Self::open_all(specs, &sock_root)?;
+                Ok(Self { dbs, order, _rt: None })
+            } else {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| format!("tokio runtime: {e}"))?;
+                let out = rt.block_on(async { Self::open_all(specs, &sock_root) });
+                let (dbs, order) = out?;
+                Ok(Self { dbs, order, _rt: Some(rt) })
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let (dbs, order) = Self::open_all(specs, &sock_root)?;
+            Ok(Self { dbs, order })
+        }
+    }
+
+    fn open_all(
+        specs: Vec<DbSpec>,
+        sock_root: &Path,
+    ) -> Result<(HashMap<String, Arc<Cluster>>, Vec<String>), String> {
+        let mut dbs = HashMap::with_capacity(specs.len());
+        let mut order = Vec::with_capacity(specs.len());
+        for s in specs {
+            // Mesh boundary, materialized on all platforms (the mesh
+            // itself is unix-only, but the per-db dir existing
+            // everywhere keeps the invariant observable + fails fast
+            // on an unwritable root).
+            let sub = sock_root.join(&s.name);
+            std::fs::create_dir_all(&sub)
+                .map_err(|e| format!("database `{}` sock dir: {e}", s.name))?;
+            let mut cfg = s.config;
+            cfg.sock_dir = sub;
+            let refs: Vec<&str> = s.paths.iter().map(|p| p.as_str()).collect();
+            let c = Cluster::open_with_config(&refs, cfg)
+                .map_err(|e| format!("database `{}`: {e}", s.name))?;
+            order.push(s.name.clone());
+            dbs.insert(s.name, Arc::new(c));
+        }
+        Ok((dbs, order))
+    }
+
+    /// Exact-name lookup. `None` = unknown (caller 404s). No default.
+    pub fn get(&self, name: &str) -> Option<Arc<Cluster>> {
+        self.dbs.get(name).cloned()
+    }
+
+    /// Declared names in declaration order.
+    pub fn names(&self) -> Vec<String> {
+        self.order.clone()
     }
 }

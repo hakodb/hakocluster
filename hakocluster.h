@@ -62,6 +62,24 @@ char *hk_cluster_refresh_health(HK_Cluster *handle);
 /* Option C rotation tick. 0 ok, -1 error. */
 int hk_cluster_tick_flush(HK_Cluster *handle);
 
+/* Multidatabase registry (one process, N named databases).
+ * Config JSON: '{"sock_root":"...","databases":[{"name":"billing",
+ * "paths":["/data/b1"],"config":{...}}]}' — per-db "config" reuses the
+ * shape above (optional); "sock_root" required (each database meshes
+ * under sock_root/{name}: the mesh boundary). Fixed at open; unknown
+ * names are always an error, never a default. */
+typedef struct HK_Databases HK_Databases;
+
+HK_Databases *hk_databases_open(const char *config_json);
+void hk_databases_close(HK_Databases *handle);
+
+/* Exact-name lookup: fresh HK_Cluster box over the SAME cluster (one
+ * mesh, many handles — close with hk_cluster_close). NULL on unknown. */
+HK_Cluster *hk_db_get(HK_Databases *handle, const char *name);
+
+/* Declared names in declaration order, as a JSON array string. */
+char *hk_databases_names(HK_Databases *handle);
+
 /* Free a string returned by any hk_cluster_* call. */
 void hk_cluster_string_free(char *value);
 

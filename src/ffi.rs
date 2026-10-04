@@ -21,16 +21,25 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::Arc;
 
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::query::query::Query;
 
-use crate::{Cluster, ClusterConfig, StaggerPolicy};
+use crate::{Cluster, ClusterConfig, Databases, DbSpec, StaggerPolicy, valid_db_name};
 
 #[allow(non_camel_case_types)]
 pub struct HK_Cluster {
-    inner: Cluster,
+    // ponytail: Arc (not owned Cluster) so registry lookups hand out
+    // the SAME cluster behind a fresh box — one mesh, many handles.
+    // Call sites deref unchanged.
+    inner: Arc<Cluster>,
+}
+
+#[allow(non_camel_case_types)]
+pub struct HK_Databases {
+    inner: Databases,
 }
 
 thread_local! {
@@ -109,6 +118,12 @@ pub extern "C" fn hk_cluster_last_error() -> *const c_char {
 fn parse_config(json: &str) -> Result<ClusterConfig, String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| e.to_string())?;
+    parse_config_value(&v)
+}
+
+// ponytail: Value-taking core so the registry reuses the single-cluster
+// parser verbatim on per-db fragments (no second parser to drift).
+fn parse_config_value(v: &serde_json::Value) -> Result<ClusterConfig, String> {
     let mut cfg = ClusterConfig::default();
     let get = |k: &str| v.get(k);
     if let Some(s) = get("durability").and_then(|x| x.as_str()) {
@@ -179,7 +194,7 @@ fn open_impl(paths_json: &str, cfg_json: Option<&str>) -> Result<*mut HK_Cluster
         return Err("config needs sock_dir".into());
     }
     let cluster = Cluster::open_with_config(&refs, cfg).map_err(|e| e)?;
-    Ok(Box::into_raw(Box::new(HK_Cluster { inner: cluster })))
+    Ok(Box::into_raw(Box::new(HK_Cluster { inner: Arc::new(cluster) })))
 }
 
 /// Open a cluster: `paths_json` = `["/data/a","/data/b"]`;
@@ -225,7 +240,7 @@ pub extern "C" fn hk_cluster_open(
         match Cluster::open_with_config(&refs, cfg) {
             Ok(cluster) => {
                 clear_last_error();
-                Box::into_raw(Box::new(HK_Cluster { inner: cluster }))
+                Box::into_raw(Box::new(HK_Cluster { inner: Arc::new(cluster) }))
             }
             Err(e) => {
                 set_last_error(e);
@@ -577,5 +592,147 @@ pub extern "C" fn hk_cluster_tick_flush(handle: *mut HK_Cluster) -> i32 {
                 -1
             }
         }
+    })
+}
+
+// --- Multidatabase registry (hakocluster#6) ---
+//
+// Config JSON: `{"sock_root":"...","databases":[{"name":"billing",
+// "paths":["/data/b1"],"config":{...}}]}` — per-db `config` reuses the
+// module-docs shape; `sock_root` is required (each database meshes
+// under `sock_root/{name}`, the mesh boundary). All keys required
+// except per-db `config` (defaults).
+
+fn parse_databases(json: &str) -> Result<(Vec<DbSpec>, String), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let root = v
+        .get("sock_root")
+        .and_then(|x| x.as_str())
+        .ok_or("config needs sock_root")?
+        .to_string();
+    let arr = v
+        .get("databases")
+        .and_then(|x| x.as_array())
+        .ok_or("config needs databases[]")?;
+    let mut specs = Vec::with_capacity(arr.len());
+    for d in arr {
+        let name = d
+            .get("name")
+            .and_then(|x| x.as_str())
+            .ok_or("database needs name")?;
+        if !valid_db_name(name) {
+            return Err(format!("bad database name `{name}`"));
+        }
+        let paths = d
+            .get("paths")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| format!("database `{name}` needs paths[]"))?
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| format!("database `{name}` paths must be strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Reuse the single-cluster parser verbatim on the fragment.
+        let cfg = match d.get("config") {
+            Some(c) => parse_config_value(c)?,
+            None => ClusterConfig::default(),
+        };
+        specs.push(DbSpec { name: name.to_string(), paths, config: cfg });
+    }
+    Ok((specs, root))
+}
+
+/// Open N named databases: returns the registry handle, null on error.
+/// Fixed at open (reload re-opens); unknown names are always an error,
+/// never a default.
+#[no_mangle]
+pub extern "C" fn hk_databases_open(config_json: *const c_char) -> *mut HK_Databases {
+    shield!(ptr::null_mut(), {
+        let js = match cstr_to_string(config_json) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let (specs, root) = match parse_databases(&js) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        match Databases::open(specs, root.into()) {
+            Ok(dbs) => {
+                clear_last_error();
+                Box::into_raw(Box::new(HK_Databases { inner: dbs }))
+            }
+            Err(e) => {
+                set_last_error(e);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Close the registry (stops every mesh).
+#[no_mangle]
+pub extern "C" fn hk_databases_close(handle: *mut HK_Databases) {
+    if !handle.is_null() {
+        shield!((), {
+            unsafe {
+                drop(Box::from_raw(handle));
+            }
+        });
+    }
+}
+
+/// Look up a database by exact name: fresh `HK_Cluster` box over the
+/// SAME cluster (one mesh, many handles — close with
+/// `hk_cluster_close`). Null on unknown name (see last_error); there
+/// is no default database.
+#[no_mangle]
+pub extern "C" fn hk_db_get(handle: *mut HK_Databases, name: *const c_char) -> *mut HK_Cluster {
+    shield!(ptr::null_mut(), {
+        if handle.is_null() {
+            set_last_error("null databases");
+            return ptr::null_mut();
+        }
+        let n = match cstr_to_string(name) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let dbs: &HK_Databases = unsafe { &*handle };
+        match dbs.inner.get(&n) {
+            Some(c) => {
+                clear_last_error();
+                Box::into_raw(Box::new(HK_Cluster { inner: c }))
+            }
+            None => {
+                set_last_error(format!("unknown database `{n}`"));
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Declared names in declaration order, as a JSON array string.
+#[no_mangle]
+pub extern "C" fn hk_databases_names(handle: *mut HK_Databases) -> *mut c_char {
+    shield!(ptr::null_mut(), {
+        if handle.is_null() {
+            set_last_error("null databases");
+            return ptr::null_mut();
+        }
+        let dbs: &HK_Databases = unsafe { &*handle };
+        let arr: Vec<serde_json::Value> =
+            dbs.inner.names().into_iter().map(serde_json::Value::String).collect();
+        ok_string(serde_json::Value::Array(arr).to_string())
     })
 }
