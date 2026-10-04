@@ -703,8 +703,15 @@ impl Databases {
         let mut dbs = HashMap::with_capacity(specs.len());
         let mut order = Vec::with_capacity(specs.len());
         for s in specs {
+            // Mesh boundary, materialized on all platforms (the mesh
+            // itself is unix-only, but the per-db dir existing
+            // everywhere keeps the invariant observable + fails fast
+            // on an unwritable root).
+            let sub = sock_root.join(&s.name);
+            std::fs::create_dir_all(&sub)
+                .map_err(|e| format!("database `{}` sock dir: {e}", s.name))?;
             let mut cfg = s.config;
-            cfg.sock_dir = sock_root.join(&s.name);
+            cfg.sock_dir = sub;
             let refs: Vec<&str> = s.paths.iter().map(|p| p.as_str()).collect();
             let c = Cluster::open_with_config(&refs, cfg)
                 .map_err(|e| format!("database `{}`: {e}", s.name))?;
