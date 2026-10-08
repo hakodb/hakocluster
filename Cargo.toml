@@ -17,3 +17,8 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "m
 # JSON boundary for the C ABI (go/pascal consumers): docs and queries
 # cross as UTF-8 strings, never as structs.
 serde_json = "1"
+
+[build-dependencies]
+# Header generation (same pattern as hakodb): cbindgen emits
+# target/<profile>/hakocluster.h from the #[no_mangle] fns every build.
+cbindgen = "0.28"

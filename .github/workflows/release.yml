@@ -2,8 +2,9 @@ name: release
 
 # hakocluster native-library releases for C ABI consumers (go, pascal,
 # ...). Leaner than hakodb's matrix: windows .dll + linux .so per glibc
-# family + macos .dylib, all carrying the hand-written hakocluster.h
-# (the C API is small and stable — no cbindgen step).
+# family + macos .dylib, all carrying the cbindgen-generated hakocluster.h
+# from the build that produced them (same pattern as hakodb — declarations
+# always match the shipped cdylib, never hand-synced).
 #
 # Tag v* to release. Consumers pin assets by tag:
 # hakocluster-<version>-<target>.{zip,tar.gz} + flat files.
@@ -32,7 +33,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/hakocluster.dll dist/
           Copy-Item target/release/hakocluster.dll.lib dist/hakocluster.lib
-          Copy-Item hakocluster.h dist/
+          Copy-Item target/release/hakocluster.h dist/
           Copy-Item tests/ffi_smoke.c dist/
           (Get-FileHash dist/hakocluster.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
           (Get-FileHash dist/hakocluster.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
@@ -70,7 +71,7 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp target/release/libhakocluster.so hakocluster.h tests/ffi_smoke.c dist/
+          cp target/release/libhakocluster.so target/release/hakocluster.h tests/ffi_smoke.c dist/
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
@@ -87,7 +88,7 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp target/release/libhakocluster.dylib hakocluster.h tests/ffi_smoke.c dist/
+          cp target/release/libhakocluster.dylib target/release/hakocluster.h tests/ffi_smoke.c dist/
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:

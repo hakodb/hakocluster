@@ -20,7 +20,8 @@ hakocluster = "0.2"
 
 ## Non-Rust consumers (go, pascal, ...)
 
-The C ABI (`src/ffi.rs`, header `hakocluster.h`) speaks JSON across the
+The C ABI (`src/ffi.rs`, header `target/<profile>/hakocluster.h`,
+cbindgen-generated every build) speaks JSON across the
 boundary — docs and queries cross as UTF-8 strings, never as structs.
 Binaries per tag live on the [releases page](../../releases): windows
 `.dll`, linux `.so` per glibc family, macos `.dylib`, each bundled with
