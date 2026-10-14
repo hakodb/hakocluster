@@ -1,6 +1,6 @@
 [package]
 name = "hakocluster"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 description = "In-process dispatcher over N hakodb instances: reads fan out, writes route, socket_sync keeps replicas identical"
 license = "MIT"
@@ -22,3 +22,11 @@ serde_json = "1"
 # Header generation (same pattern as hakodb): cbindgen emits
 # target/<profile>/hakocluster.h from the #[no_mangle] fns every build.
 cbindgen = "0.28"
+
+# ponytail: same size treatment as hakodb (duelled there): thin-LTO +
+# single codegen unit + strip, opt-level 3 kept (opt-z rejected: +20-50%
+# on hot read paths). No opt-level experiment needed here.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
