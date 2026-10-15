@@ -44,4 +44,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: check + test with tailer features
-        run: cargo test --features tailer-mesh,tailer-cloud
+        # All three states (mesh-only, cloud-only, both): cfg-gated
+        # matches must compile in every combination, not just both-on.
+        run: |
+          cargo test --features tailer-mesh,tailer-cloud
+          cargo check --tests --no-default-features --features tailer-mesh
+          cargo check --tests --no-default-features --features tailer-cloud

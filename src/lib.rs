@@ -233,6 +233,10 @@ impl TailerBridge {
                 .start(url)
                 .await
                 .map_err(|e| format!("tailer cloud start: {e}")),
+            // No transport compiled in: unreachable (open fails closed
+            // before construction), but the empty enum still needs an arm.
+            #[cfg(not(any(feature = "tailer-mesh", feature = "tailer-cloud")))]
+            _ => unreachable!("tailer bridge without transport"),
         }
     }
 
@@ -242,6 +246,8 @@ impl TailerBridge {
             Self::Mesh(s, _) => s.stop(),
             #[cfg(feature = "tailer-cloud")]
             Self::Cloud(s, _) => s.stop(),
+            #[cfg(not(any(feature = "tailer-mesh", feature = "tailer-cloud")))]
+            _ => {}
         }
     }
 }
