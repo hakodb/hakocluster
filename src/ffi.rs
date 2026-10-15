@@ -161,15 +161,32 @@ fn parse_config_value(v: &serde_json::Value) -> Result<ClusterConfig, String> {
                 .and_then(|x| x.as_str())
                 .ok_or_else(|| format!("tailer_cloud.{k} required"))
         };
-        // Client-only (no "mode" key): a tailer-server cannot serve
-        // room-namespaced data from a box-local dataset, so there is
-        // nothing to select. Run hubs standalone.
+        // Mode selects which keys matter; anything else fail-closes.
+        let mode = match t.get("mode").and_then(|x| x.as_str()) {
+            Some("client") => {
+                let (room_name, room_key, server_url) =
+                    (req("room_name")?, req("room_key")?, req("server_url")?);
+                crate::TailerCloudMode::Client {
+                    room_name: room_name.into(),
+                    room_key: room_key.into(),
+                    server_url: server_url.into(),
+                }
+            }
+            Some("server") => {
+                let (room_name, room_key, bind_addr) =
+                    (req("room_name")?, req("room_key")?, req("bind_addr")?);
+                crate::TailerCloudMode::Server {
+                    room_name: room_name.into(),
+                    room_key: room_key.into(),
+                    bind_addr: bind_addr.into(),
+                }
+            }
+            _ => return Err("tailer_cloud.mode must be \"client\" or \"server\"".into()),
+        };
         cfg.tailer_cloud = Some(crate::TailerCloud {
             client_id: req("client_id")?.into(),
-            room_name: req("room_name")?.into(),
-            room_key: req("room_key")?.into(),
             auth_token: req("auth_token")?.into(),
-            server_url: req("server_url")?.into(),
+            mode,
         });
     }
     if let Some(s) = get("stagger") {

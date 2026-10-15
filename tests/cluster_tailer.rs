@@ -2,7 +2,7 @@
 //! Functional N+1 tests are unix-only (socket mesh); they live behind
 //! matching cfgs below so Windows CI covers the contract too.
 
-use hakocluster::{Cluster, ClusterConfig, TailerCloud, TailerMesh};
+use hakocluster::{Cluster, ClusterConfig, TailerCloud, TailerCloudMode, TailerMesh};
 
 fn cfg() -> ClusterConfig {
     ClusterConfig::default()
@@ -19,10 +19,12 @@ fn mesh_knob() -> TailerMesh {
 fn cloud_knob() -> TailerCloud {
     TailerCloud {
         client_id: "tailer-1".into(),
-        room_name: "ops".into(),
-        room_key: "room-secret".into(),
         auth_token: "tok".into(),
-        server_url: "ws://127.0.0.1:9".into(),
+        mode: TailerCloudMode::Client {
+            room_name: "ops".into(),
+            room_key: "room-secret".into(),
+            server_url: "ws://127.0.0.1:9".into(),
+        },
     }
 }
 
@@ -131,9 +133,7 @@ fn cloud_tailer_opens_without_server() {
 }
 
 /// FFI config shapes (parse-level, all platforms): missing keys fail
-/// loud with the key named. A tailer-server mode was tried and removed:
-/// the server broadcast only serves room-owned collections, so a box-
-/// local dataset could never broadcast — hubs run standalone.
+/// loud with the key named; unknown mode fails loud.
 #[test]
 fn ffi_cloud_shapes_fail_closed() {
     use std::ffi::{CStr, CString};
@@ -163,23 +163,29 @@ fn ffi_cloud_shapes_fail_closed() {
         }
     }
 
-    // Unknown mode key is just unknown (flat client-only shape).
+    // Unknown mode.
     let e = try_open(r#"{"tailer_cloud":{"client_id":"t","auth_token":"k","mode":"hub"}}"#)
-        .expect_err("missing client keys must fail");
-    assert!(e.contains("room_name"), "unexpected: {e}");
-    // Missing server_url.
+        .expect_err("bad mode must fail");
+    assert!(e.contains("mode"), "unexpected: {e}");
+    // Missing server_url in client mode.
     let e = try_open(
-        r#"{"tailer_cloud":{"client_id":"t","auth_token":"k","room_name":"ops","room_key":"rk"}}"#,
+        r#"{"tailer_cloud":{"client_id":"t","auth_token":"k","mode":"client","room_name":"ops","room_key":"rk"}}"#,
     )
     .expect_err("missing url must fail");
     assert!(e.contains("server_url"), "unexpected: {e}");
+    // Missing bind_addr in server mode.
+    let e = try_open(
+        r#"{"tailer_cloud":{"client_id":"t","auth_token":"k","mode":"server","room_name":"ops","room_key":"rk"}}"#,
+    )
+    .expect_err("missing bind must fail");
+    assert!(e.contains("bind_addr"), "unexpected: {e}");
 }
 
-/// End-to-end across boxes on loopback (unix + cloud feature): a
-/// STANDALONE hub plus two client-tailer boxes. A tailer-server was
-/// tried first and failed for a structural reason (server broadcast
-/// only serves room-owned collections; box-local writes land plain) —
-/// this is the supported topology. Write on A reads on B.
+/// End-to-end across boxes on loopback (unix + cloud feature):
+/// box A tails in SERVER mode (hosts the room), box B tails as client.
+/// Write on A reads on B. This exact shape failed under the old
+/// prefix-namespaced server (broadcast skipped plain collections) and
+/// now proves the single-room design: box-local data IS room data.
 #[cfg(all(unix, feature = "tailer-cloud"))]
 #[test]
 fn cloud_tailer_bridges_two_boxes() {
@@ -190,42 +196,36 @@ fn cloud_tailer_bridges_two_boxes() {
     };
     let room = format!("e2e-{}", std::process::id());
 
-    // Standalone hub (its own runtime; lives until the end of the test).
-    let hub_rt = tokio::runtime::Runtime::new().expect("hub runtime");
-    use hakodb::engine::Hako;
-    let hub_dir = tmpdir("hub");
-    let hub_db = std::sync::Arc::new(
-        Hako::open(
-            hub_dir.join("db").to_string_lossy().as_ref(),
-            Default::default(),
-        )
-        .expect("hub db"),
-    );
-    let hub = hakodb::cloud_sync::CloudSync::server(hub_db.clone(), "hub-1", "shared-secret");
-    hub_rt
-        .block_on(hub.start(&format!("127.0.0.1:{port}")))
-        .expect("hub serves");
-
-    let client_knob = |id: &str| TailerCloud {
-        client_id: id.into(),
-        room_name: room.clone(),
-        room_key: "shared-secret".into(),
-        auth_token: "shared-secret".into(),
-        server_url: format!("ws://127.0.0.1:{port}"),
-    };
-
     let dir_a = tmpdir("bridgeA");
     let dir_b = tmpdir("bridgeB");
     let mut ca = cfg();
     ca.sock_dir = dir_a.join("socks");
-    ca.tailer_cloud = Some(client_knob("box-a"));
+    ca.tailer_cloud = Some(TailerCloud {
+        client_id: "box-a".into(),
+        auth_token: "shared-secret".into(),
+        mode: TailerCloudMode::Server {
+            room_name: room.clone(),
+            room_key: "shared-secret".into(),
+            bind_addr: format!("127.0.0.1:{port}"),
+        },
+    });
     let mut cb = cfg();
     cb.sock_dir = dir_b.join("socks");
-    cb.tailer_cloud = Some(client_knob("box-b"));
+    cb.tailer_cloud = Some(TailerCloud {
+        client_id: "box-b".into(),
+        auth_token: "shared-secret".into(),
+        mode: TailerCloudMode::Client {
+            room_name: room.clone(),
+            room_key: "shared-secret".into(),
+            server_url: format!("ws://127.0.0.1:{port}"),
+        },
+    });
     let box_a = Cluster::open_with_config(&[dir_a.join("a").to_string_lossy().as_ref()], ca)
-        .expect("box A opens");
+        .expect("server box opens");
     let box_b = Cluster::open_with_config(&[dir_b.join("a").to_string_lossy().as_ref()], cb)
-        .expect("box B opens");
+        .expect("client box opens");
+    assert_eq!(box_a.tailer_index(), Some(1));
+    assert_eq!(box_b.tailer_index(), Some(1));
 
     // Write on A's writer; poll B until the bridge delivers (or timeout).
     {
@@ -246,11 +246,6 @@ fn cloud_tailer_bridges_two_boxes() {
     assert!(seen, "bridge did not deliver A->B within 60s");
     drop(box_a);
     drop(box_b);
-    hub.stop();
-    drop(hub);
-    drop(hub_db);
-    drop(hub_rt);
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
-    let _ = std::fs::remove_dir_all(&hub_dir);
 }
