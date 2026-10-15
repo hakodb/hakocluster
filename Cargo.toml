@@ -9,6 +9,12 @@ repository = "https://github.com/hakodb/hakocluster"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Sync tailer transports (issue #23, unix-only): each pulls its hakodb
+# lane. Default build stays socket-only (see size note on hakodb below).
+[features]
+tailer-mesh = ["hakodb/net-sync"]
+tailer-cloud = ["hakodb/cloud-sync"]
+
 [dependencies]
 # ponytail: only the socket-sync lane (tokio). net-sync/cloud-sync pull
 # mdns/rustls/tungstenite — unneeded here, and each is minutes of compile.

@@ -139,6 +139,36 @@ fn parse_config_value(v: &serde_json::Value) -> Result<ClusterConfig, String> {
     if let Some(m) = get("max_lag") {
         cfg.max_replica_lag_versions = m.as_u64();
     }
+    // Sync tailer knobs (issue #23): plain data, parsed everywhere so
+    // malformed shapes fail the same on every platform; behavior is
+    // feature-gated at open (fail-closed without the transport).
+    if let Some(t) = get("tailer_mesh") {
+        let name = t.get("name").and_then(|x| x.as_str()).ok_or("tailer_mesh.name required")?;
+        let room_key = t.get("room_key").and_then(|x| x.as_str()).ok_or("tailer_mesh.room_key required")?;
+        let port = t.get("port").and_then(|x| x.as_u64()).ok_or("tailer_mesh.port required")?;
+        if port > 65535 {
+            return Err("tailer_mesh.port out of range".into());
+        }
+        cfg.tailer_mesh = Some(crate::TailerMesh {
+            name: name.into(),
+            room_key: room_key.into(),
+            port: port as u16,
+        });
+    }
+    if let Some(t) = get("tailer_cloud") {
+        let req = |k: &str| {
+            t.get(k)
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("tailer_cloud.{k} required"))
+        };
+        cfg.tailer_cloud = Some(crate::TailerCloud {
+            client_id: req("client_id")?.into(),
+            room_name: req("room_name")?.into(),
+            room_key: req("room_key")?.into(),
+            auth_token: req("auth_token")?.into(),
+            server_url: req("server_url")?.into(),
+        });
+    }
     if let Some(s) = get("stagger") {
         cfg.stagger = if let Some(arr) = s.get("intervals").and_then(|x| x.as_array()) {
             let mut iv = Vec::with_capacity(arr.len());
