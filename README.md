@@ -15,8 +15,30 @@ configurable `group_commit_interval_ms` (1..=30_000, default 5).
 
 ```toml
 [dependencies]
-hakocluster = "0.2"
+hakocluster = "0.3"
 ```
+
+## Multidatabase: named clusters in one process
+
+`Databases` holds N named clusters behind exact-name lookup — no
+default database (a silent default would route writes somewhere the
+operator did not choose). Each database meshes under
+`sock_root/{name}` (the mesh boundary); bad/duplicate/empty
+declarations, or any per-db open failure, refuse the whole registry.
+
+```rust
+let dbs = Databases::open(vec![
+    DbSpec { name: "billing".into(), paths: vec!["/data/b1".into()], config: ClusterConfig::default() },
+    DbSpec { name: "analytics".into(), paths: vec!["/data/a1".into(), "/data/a2".into()], config: ClusterConfig::default() },
+], "/run/hc".into())?;
+let billing = dbs.get("billing").expect("unknown name");
+```
+
+C ABI: `hk_databases_open(config_json)` (`{"sock_root":"…","databases":[{"name","paths","config"}]}`),
+`hk_db_get` (fresh `HK_Cluster` handle over the same cluster),
+`hk_databases_names`, `hk_databases_close`. Members are Hako data
+dirs only — other engines (sqlite, …) are backend drivers, not
+cluster members.
 
 ## Non-Rust consumers (go, pascal, ...)
 
