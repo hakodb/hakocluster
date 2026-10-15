@@ -109,15 +109,35 @@ pub struct TailerMesh {
     pub port: u16,
 }
 
-/// Bridge knobs for the +1 tailer member: run a cloud-sync client against
-/// this hub. The tailer is always a client (a bridge never serves).
+/// Bridge knobs for the +1 tailer member: run a cloud-sync endpoint.
+/// The tailer is always a bridge, never a served hub for humans — but it
+/// can play either protocol side: a client joining someone's hub, or a
+/// server hub for other boxes' tailer-clients (edge hierarchy).
 #[derive(Debug, Clone)]
 pub struct TailerCloud {
+    /// Identity on the wire (client id, or server id in server mode).
     pub client_id: String,
-    pub room_name: String,
-    pub room_key: String,
+    /// Hub secret (client presents it; server enforces it).
     pub auth_token: String,
-    pub server_url: String,
+    /// Which side of the wire to play. Exactly one — no default (a
+    /// silent default would point the bridge somewhere unintended).
+    pub mode: TailerCloudMode,
+}
+
+/// Cloud bridge direction. Client joins a hub; server hosts a room for
+/// other tailers. Room keys only exist client-side (the server is
+/// room-agnostic by design — see hakodb cloud_sync).
+#[derive(Debug, Clone)]
+pub enum TailerCloudMode {
+    Client {
+        room_name: String,
+        room_key: String,
+        server_url: String,
+    },
+    Server {
+        /// Local bind address, e.g. `"0.0.0.0:8080"`.
+        bind_addr: String,
+    },
 }
 
 impl Default for ClusterConfig {
@@ -204,16 +224,31 @@ impl TailerBridge {
         }
         #[cfg(feature = "tailer-cloud")]
         if let Some(c) = &cfg.tailer_cloud {
-            return Ok(Self::Cloud(
-                hakodb::cloud_sync::CloudSync::client(
-                    db.clone(),
-                    &c.client_id,
-                    &c.room_name,
-                    &c.room_key,
-                    &c.auth_token,
+            let (sync, endpoint) = match &c.mode {
+                TailerCloudMode::Client {
+                    room_name,
+                    room_key,
+                    server_url,
+                } => (
+                    hakodb::cloud_sync::CloudSync::client(
+                        db.clone(),
+                        &c.client_id,
+                        room_name,
+                        room_key,
+                        &c.auth_token,
+                    ),
+                    server_url.clone(),
                 ),
-                c.server_url.clone(),
-            ));
+                TailerCloudMode::Server { bind_addr } => (
+                    hakodb::cloud_sync::CloudSync::server(
+                        db.clone(),
+                        &c.client_id,
+                        &c.auth_token,
+                    ),
+                    bind_addr.clone(),
+                ),
+            };
+            return Ok(Self::Cloud(sync, endpoint));
         }
         Err("tailer knobs set but no tailer transport compiled in".into())
     }
