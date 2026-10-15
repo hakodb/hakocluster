@@ -161,6 +161,9 @@ fn parse_config_value(v: &serde_json::Value) -> Result<ClusterConfig, String> {
                 .and_then(|x| x.as_str())
                 .ok_or_else(|| format!("tailer_cloud.{k} required"))
         };
+        // Client-only (no "mode" key): a tailer-server cannot serve
+        // room-namespaced data from a box-local dataset, so there is
+        // nothing to select. Run hubs standalone.
         cfg.tailer_cloud = Some(crate::TailerCloud {
             client_id: req("client_id")?.into(),
             room_name: req("room_name")?.into(),

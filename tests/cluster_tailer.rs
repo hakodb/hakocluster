@@ -129,3 +129,128 @@ fn cloud_tailer_opens_without_server() {
     drop(cluster);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// FFI config shapes (parse-level, all platforms): missing keys fail
+/// loud with the key named. A tailer-server mode was tried and removed:
+/// the server broadcast only serves room-owned collections, so a box-
+/// local dataset could never broadcast — hubs run standalone.
+#[test]
+fn ffi_cloud_shapes_fail_closed() {
+    use std::ffi::{CStr, CString};
+    use hakocluster::ffi as ffi_mod;
+
+    fn try_open(cfg_json: &str) -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!(
+            "hc-tailer-ffi-{}-{}",
+            std::process::id(),
+            cfg_json.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = format!("[\"{}\"]", dir.join("a").to_string_lossy().replace('\\', "/"));
+        let p = CString::new(paths).unwrap();
+        let c = CString::new(cfg_json).unwrap();
+        let h = ffi_mod::hk_cluster_open_with_config(p.as_ptr(), c.as_ptr());
+        if h.is_null() {
+            let e = unsafe { CStr::from_ptr(ffi_mod::hk_cluster_last_error()) }
+                .to_string_lossy()
+                .into_owned();
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(e)
+        } else {
+            ffi_mod::hk_cluster_close(h);
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(())
+        }
+    }
+
+    // Unknown mode key is just unknown (flat client-only shape).
+    let e = try_open(r#"{"tailer_cloud":{"client_id":"t","auth_token":"k","mode":"hub"}}"#)
+        .expect_err("missing client keys must fail");
+    assert!(e.contains("room_name"), "unexpected: {e}");
+    // Missing server_url.
+    let e = try_open(
+        r#"{"tailer_cloud":{"client_id":"t","auth_token":"k","room_name":"ops","room_key":"rk"}}"#,
+    )
+    .expect_err("missing url must fail");
+    assert!(e.contains("server_url"), "unexpected: {e}");
+}
+
+/// End-to-end across boxes on loopback (unix + cloud feature): a
+/// STANDALONE hub plus two client-tailer boxes. A tailer-server was
+/// tried first and failed for a structural reason (server broadcast
+/// only serves room-owned collections; box-local writes land plain) —
+/// this is the supported topology. Write on A reads on B.
+#[cfg(all(unix, feature = "tailer-cloud"))]
+#[test]
+fn cloud_tailer_bridges_two_boxes() {
+    // Free port without racing the world for long: bind, read, drop.
+    let port: u16 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+        l.local_addr().expect("addr").port()
+    };
+    let room = format!("e2e-{}", std::process::id());
+
+    // Standalone hub (its own runtime; lives until the end of the test).
+    let hub_rt = tokio::runtime::Runtime::new().expect("hub runtime");
+    use hakodb::engine::Hako;
+    let hub_dir = tmpdir("hub");
+    let hub_db = std::sync::Arc::new(
+        Hako::open(
+            hub_dir.join("db").to_string_lossy().as_ref(),
+            Default::default(),
+        )
+        .expect("hub db"),
+    );
+    let hub = hakodb::cloud_sync::CloudSync::server(hub_db.clone(), "hub-1", "shared-secret");
+    hub_rt
+        .block_on(hub.start(&format!("127.0.0.1:{port}")))
+        .expect("hub serves");
+
+    let client_knob = |id: &str| TailerCloud {
+        client_id: id.into(),
+        room_name: room.clone(),
+        room_key: "shared-secret".into(),
+        auth_token: "shared-secret".into(),
+        server_url: format!("ws://127.0.0.1:{port}"),
+    };
+
+    let dir_a = tmpdir("bridgeA");
+    let dir_b = tmpdir("bridgeB");
+    let mut ca = cfg();
+    ca.sock_dir = dir_a.join("socks");
+    ca.tailer_cloud = Some(client_knob("box-a"));
+    let mut cb = cfg();
+    cb.sock_dir = dir_b.join("socks");
+    cb.tailer_cloud = Some(client_knob("box-b"));
+    let box_a = Cluster::open_with_config(&[dir_a.join("a").to_string_lossy().as_ref()], ca)
+        .expect("box A opens");
+    let box_b = Cluster::open_with_config(&[dir_b.join("a").to_string_lossy().as_ref()], cb)
+        .expect("box B opens");
+
+    // Write on A's writer; poll B until the bridge delivers (or timeout).
+    {
+        use hakodb::document::hako_doc::HakoDoc;
+        use hakodb::document::value::Value;
+        let mut doc = HakoDoc::default();
+        doc.insert("v", Value::Int(42));
+        box_a.put("t", "k1", &doc).expect("write on A");
+    }
+    let mut seen = false;
+    for _ in 0..300 {
+        if box_b.get("t", "k1").expect("read on B").is_some() {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(seen, "bridge did not deliver A->B within 60s");
+    drop(box_a);
+    drop(box_b);
+    hub.stop();
+    drop(hub);
+    drop(hub_db);
+    drop(hub_rt);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&hub_dir);
+}

@@ -109,8 +109,13 @@ pub struct TailerMesh {
     pub port: u16,
 }
 
-/// Bridge knobs for the +1 tailer member: run a cloud-sync client against
-/// this hub. The tailer is always a client (a bridge never serves).
+/// Bridge knobs for the +1 tailer member: run a cloud-sync client
+/// against a hub. Client-only by design (see below): a tailer-server
+/// cannot serve room-namespaced data from a box-local dataset — the
+/// server broadcast only serves collections owned by a registered
+/// room, while the tailer's socket-ingested collections are plain.
+/// Run hubs standalone (CloudSync server / hakobackend), bridge from
+/// the boxes as clients.
 #[derive(Debug, Clone)]
 pub struct TailerCloud {
     pub client_id: String,
