@@ -109,20 +109,40 @@ pub struct TailerMesh {
     pub port: u16,
 }
 
-/// Bridge knobs for the +1 tailer member: run a cloud-sync client
-/// against a hub. Client-only by design (see below): a tailer-server
-/// cannot serve room-namespaced data from a box-local dataset — the
-/// server broadcast only serves collections owned by a registered
-/// room, while the tailer's socket-ingested collections are plain.
-/// Run hubs standalone (CloudSync server / hakobackend), bridge from
-/// the boxes as clients.
+/// Bridge knobs for the +1 tailer member: run a cloud-sync endpoint.
+/// Either a client joining someone's hub, or a server hosting this
+/// box's room for other boxes' tailer-clients (edge hierarchy). Works
+/// because servers are single-room with plain storage: the box-local
+/// dataset IS the room's data, so broadcast serves it directly.
 #[derive(Debug, Clone)]
 pub struct TailerCloud {
+    /// Identity on the wire (client id, or server id in server mode).
     pub client_id: String,
-    pub room_name: String,
-    pub room_key: String,
+    /// Hub secret (client presents it; server enforces it).
     pub auth_token: String,
-    pub server_url: String,
+    /// Which side of the wire to play. Exactly one — no default (a
+    /// silent default would point the bridge somewhere unintended).
+    pub mode: TailerCloudMode,
+}
+
+/// Cloud bridge direction. Client joins a hub; server hosts this box's
+/// room for other tailers. Room keys only exist client-side (one room
+/// per server, bound at construction).
+#[derive(Debug, Clone)]
+pub enum TailerCloudMode {
+    Client {
+        room_name: String,
+        room_key: String,
+        server_url: String,
+    },
+    Server {
+        /// Room this box serves.
+        room_name: String,
+        /// Room key clients must present.
+        room_key: String,
+        /// Local bind address, e.g. `"0.0.0.0:8080"`.
+        bind_addr: String,
+    },
 }
 
 impl Default for ClusterConfig {
@@ -209,16 +229,37 @@ impl TailerBridge {
         }
         #[cfg(feature = "tailer-cloud")]
         if let Some(c) = &cfg.tailer_cloud {
-            return Ok(Self::Cloud(
-                hakodb::cloud_sync::CloudSync::client(
-                    db.clone(),
-                    &c.client_id,
-                    &c.room_name,
-                    &c.room_key,
-                    &c.auth_token,
+            let (sync, endpoint) = match &c.mode {
+                TailerCloudMode::Client {
+                    room_name,
+                    room_key,
+                    server_url,
+                } => (
+                    hakodb::cloud_sync::CloudSync::client(
+                        db.clone(),
+                        &c.client_id,
+                        room_name,
+                        room_key,
+                        &c.auth_token,
+                    ),
+                    server_url.clone(),
                 ),
-                c.server_url.clone(),
-            ));
+                TailerCloudMode::Server {
+                    room_name,
+                    room_key,
+                    bind_addr,
+                } => (
+                    hakodb::cloud_sync::CloudSync::server(
+                        db.clone(),
+                        &c.client_id,
+                        &c.auth_token,
+                        room_name,
+                        room_key,
+                    ),
+                    bind_addr.clone(),
+                ),
+            };
+            return Ok(Self::Cloud(sync, endpoint));
         }
         Err("tailer knobs set but no tailer transport compiled in".into())
     }
