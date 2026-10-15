@@ -83,6 +83,41 @@ pub struct ClusterConfig {
     pub max_replica_lag_versions: Option<u64>,
     /// Directory holding one `instance-{i}.sock` per member.
     pub sock_dir: PathBuf,
+    /// Multi-box tailer via LAN mesh (issue #23): when set, open derives
+    /// one extra (+1) member whose only extra job is bridging this box to
+    /// a net-sync room. The tailer meshes locally like every member but
+    /// never serves fan-out reads and is never promotable. Exclusive with
+    /// `tailer_cloud`. Needs the `tailer-mesh` cargo feature, else open
+    /// fails closed.
+    pub tailer_mesh: Option<TailerMesh>,
+    /// Multi-box tailer via cloud hub (issue #23): same +1 shape, but the
+    /// tailer runs a cloud-sync client against `server_url`. Exclusive
+    /// with `tailer_mesh`. Needs the `tailer-cloud` cargo feature.
+    pub tailer_cloud: Option<TailerCloud>,
+}
+
+/// Bridge knobs for the +1 tailer member: join this LAN mesh room after
+/// meshing locally. Plain data (no transport types) so the knobs exist
+/// on every build; behavior is feature-gated at open.
+#[derive(Debug, Clone)]
+pub struct TailerMesh {
+    /// Mesh identity for this box (peers see it in discovery).
+    pub name: String,
+    /// Shared room secret (same room = same data).
+    pub room_key: String,
+    /// Local TCP port to serve mesh traffic on.
+    pub port: u16,
+}
+
+/// Bridge knobs for the +1 tailer member: run a cloud-sync client against
+/// this hub. The tailer is always a client (a bridge never serves).
+#[derive(Debug, Clone)]
+pub struct TailerCloud {
+    pub client_id: String,
+    pub room_name: String,
+    pub room_key: String,
+    pub auth_token: String,
+    pub server_url: String,
 }
 
 impl Default for ClusterConfig {
@@ -93,6 +128,8 @@ impl Default for ClusterConfig {
             stagger: StaggerPolicy::StaggeredStart { offset_ms: 1 },
             max_replica_lag_versions: Some(5_000_000),
             sock_dir: PathBuf::from("socks"),
+            tailer_mesh: None,
+            tailer_cloud: None,
         }
     }
 }
@@ -101,6 +138,7 @@ impl std::fmt::Debug for Cluster {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cluster")
             .field("instances", &self.instances.len())
+            .field("tailer", &self.tailer_index)
             .field("reads", &self.read_counts())
             .finish()
     }
@@ -129,6 +167,83 @@ pub struct Cluster {
     /// are spawned instead of awaited; peering converges asynchronously).
     #[cfg(unix)]
     _rt: Rt,
+    /// Index of the +1 tailer member (`None` = plain N-member cluster).
+    /// The tailer meshes locally but is skipped by read fan-out, never
+    /// promotable, and never the writer.
+    tailer_index: Option<usize>,
+    /// Live bridge handles, kept for stop-on-drop (unix only). Plain
+    /// `Option` (not shared): the bridge object is built synchronously
+    /// around an `Arc` clone for the spawn path (see open).
+    #[cfg(unix)]
+    tailer_bridge: Option<std::sync::Arc<TailerBridge>>,
+}
+
+/// The +1 member's bridge to other boxes (issue #23). One variant per
+/// transport; the enum exists on unix regardless of features (empty when
+/// neither is enabled — open fails closed before construction then).
+#[cfg(unix)]
+enum TailerBridge {
+    #[cfg(feature = "tailer-mesh")]
+    Mesh(hakodb::net_sync::NetSyncer, u16),
+    #[cfg(feature = "tailer-cloud")]
+    Cloud(hakodb::cloud_sync::CloudSync, String),
+}
+
+#[cfg(unix)]
+impl TailerBridge {
+    /// Build the bridge object around the tailer's database (synchronous
+    /// constructors only — starting needs a reactor, see `start`).
+    #[allow(unreachable_code)]
+    fn build(db: &Arc<Hako>, cfg: &ClusterConfig) -> Result<Self, String> {
+        #[cfg(feature = "tailer-mesh")]
+        if let Some(m) = &cfg.tailer_mesh {
+            return Ok(Self::Mesh(
+                hakodb::net_sync::NetSyncer::new(db.clone(), &m.name, &m.room_key, vec![]),
+                m.port,
+            ));
+        }
+        #[cfg(feature = "tailer-cloud")]
+        if let Some(c) = &cfg.tailer_cloud {
+            return Ok(Self::Cloud(
+                hakodb::cloud_sync::CloudSync::client(
+                    db.clone(),
+                    &c.client_id,
+                    &c.room_name,
+                    &c.room_key,
+                    &c.auth_token,
+                ),
+                c.server_url.clone(),
+            ));
+        }
+        Err("tailer knobs set but no tailer transport compiled in".into())
+    }
+
+    /// Start bridging: bind/dial and return (background tasks keep
+    /// running). Must run inside a reactor (block_on or spawn).
+    #[allow(unreachable_code)]
+    async fn start(&self) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "tailer-mesh")]
+            Self::Mesh(s, port) => s
+                .start(*port)
+                .await
+                .map_err(|e| format!("tailer mesh start: {e}")),
+            #[cfg(feature = "tailer-cloud")]
+            Self::Cloud(s, url) => s
+                .start(url)
+                .await
+                .map_err(|e| format!("tailer cloud start: {e}")),
+        }
+    }
+
+    fn stop(&self) {
+        match self {
+            #[cfg(feature = "tailer-mesh")]
+            Self::Mesh(s, _) => s.stop(),
+            #[cfg(feature = "tailer-cloud")]
+            Self::Cloud(s, _) => s.stop(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -195,12 +310,53 @@ impl Cluster {
         if paths.is_empty() {
             return Err("need ≥1 path".into());
         }
+        // Tailer validation (all platforms — fail-closed before anything
+        // opens, so Windows CI covers the contract too):
+        if cfg.tailer_mesh.is_some() && cfg.tailer_cloud.is_some() {
+            return Err(
+                "tailer_mesh + tailer_cloud are exclusive (one bridge per cluster)".into(),
+            );
+        }
+        let want_tailer = cfg.tailer_mesh.is_some() || cfg.tailer_cloud.is_some();
+        #[cfg(not(unix))]
+        if want_tailer {
+            return Err("sync tailer is unix-only".into());
+        }
+        #[cfg(not(feature = "tailer-mesh"))]
+        if cfg.tailer_mesh.is_some() {
+            return Err(
+                "tailer_mesh set but built without the tailer-mesh feature".into(),
+            );
+        }
+        #[cfg(not(feature = "tailer-cloud"))]
+        if cfg.tailer_cloud.is_some() {
+            return Err(
+                "tailer_cloud set but built without the tailer-cloud feature".into(),
+            );
+        }
         #[cfg(not(unix))]
         if paths.len() > 1 {
             return Err(
                 "socket peering is unix-only: N>1 clusters need a unix host".into(),
             );
         }
+
+        // The +1 tailer (issue #23) is derived, never declared: N serving
+        // paths from the caller plus one sibling dir for the bridge
+        // member. It meshes locally like every member; bridge behavior
+        // (fan-out skip, never promotable) keys off `tailer_index`.
+        let tailer_dir: Option<String> = want_tailer.then(|| {
+            format!(
+                "{}.tailer",
+                paths[0].trim_end_matches('/')
+            )
+        });
+        let tailer_index: Option<usize> = tailer_dir.as_ref().map(|_| paths.len());
+        let all: Vec<&str> = paths
+            .iter()
+            .map(|s| s.as_ref())
+            .chain(tailer_dir.as_deref())
+            .collect();
 
         // Resolve the per-instance group-commit window. StaggeredStart
         // shares one value; PerInstance overrides per index (length
@@ -210,14 +366,14 @@ impl Cluster {
         // the rotation's back, defeating the point).
         let intervals: Vec<u64> = match &cfg.stagger {
             StaggerPolicy::StaggeredStart { .. } => {
-                vec![cfg.group_commit_interval_ms; paths.len()]
+                vec![cfg.group_commit_interval_ms; all.len()]
             }
             StaggerPolicy::PerInstance(v) => {
-                if v.len() != paths.len() {
+                if v.len() != all.len() {
                     return Err(format!(
                         "PerInstance needs one interval per path (got {} for {})",
                         v.len(),
-                        paths.len()
+                        all.len()
                     ));
                 }
                 v.clone()
@@ -228,7 +384,7 @@ impl Cluster {
                         "ManualRotation needs durability_mode = Manual".into(),
                     );
                 }
-                vec![cfg.group_commit_interval_ms; paths.len()]
+                vec![cfg.group_commit_interval_ms; all.len()]
             }
         };
         let stagger_gap =
@@ -237,8 +393,8 @@ impl Cluster {
                 StaggerPolicy::PerInstance(_) | StaggerPolicy::ManualRotation => 0,
             };
 
-        let mut dbs = Vec::with_capacity(paths.len());
-        for (n, p) in paths.iter().enumerate() {
+        let mut dbs = Vec::with_capacity(all.len());
+        for (n, p) in all.iter().enumerate() {
             if n > 0 && stagger_gap > 0 {
                 // Phase the group-commit windows: each WAL's last_sync
                 // starts at its own open, so spaced opens = phased flushes.
@@ -283,9 +439,10 @@ impl Cluster {
             // Fail-closed both sides (synchronous, deterministic from
             // boot): only the designated writer accepts local writes.
             // Replicated ingest bypasses the flag by design, so replicas
-            // keep converging while read-only.
+            // keep converging while read-only. The tailer is always
+            // read-only (never promotable — see promote).
             for (n, inst) in instances.iter().enumerate() {
-                inst.db.set_read_only(n != 0);
+                inst.db.set_read_only(n != 0 || Some(n) == tailer_index);
             }
             // Mesh setup: serve needs a reactor context
             // (UnixListener::from_std) in both cases.
@@ -344,6 +501,32 @@ impl Cluster {
                     });
                 }
             }
+            // The +1 tailer bridges after the local mesh is up (fail the
+            // open if the bridge won't start — a silent unbridged tailer
+            // is a split-brain-in-waiting). Owned awaits; Shared spawns
+            // (same shape as the mesh above); Drop stops either way.
+            let tailer_bridge: Option<std::sync::Arc<TailerBridge>> = tailer_index
+                .map(|t| {
+                    TailerBridge::build(&instances[t].db, &cfg).map(std::sync::Arc::new)
+                })
+                .transpose()?;
+            match &rt {
+                Rt::Owned(r) => {
+                    if let Some(b) = &tailer_bridge {
+                        r.block_on(b.start())?;
+                    }
+                }
+                Rt::Shared(h) => {
+                    if let Some(b) = &tailer_bridge {
+                        let bb = b.clone();
+                        h.spawn(async move {
+                            if let Err(e) = bb.start().await {
+                                eprintln!("[hakocluster] tailer failed: {e}");
+                            }
+                        });
+                    }
+                }
+            }
             return Ok(Self {
                 instances,
                 rr: AtomicUsize::new(0),
@@ -352,6 +535,8 @@ impl Cluster {
                 promotions: std::sync::Mutex::new(Vec::new()),
                 flush_rr: AtomicUsize::new(0),
                 max_lag: cfg.max_replica_lag_versions,
+                tailer_index,
+                tailer_bridge,
                 _rt: rt,
             });
         }
@@ -376,6 +561,9 @@ impl Cluster {
             promotions: std::sync::Mutex::new(Vec::new()),
             flush_rr: AtomicUsize::new(0),
             max_lag: cfg.max_replica_lag_versions,
+            // Always None here (tailer knobs rejected above); the
+            // variable keeps both constructors honest.
+            tailer_index,
         })
     }
 
@@ -408,6 +596,11 @@ impl Cluster {
                 "promote: index {index} out of range (n={})",
                 self.instances.len()
             ));
+        }
+        // The tailer bridges; it never takes the writer role (a writer
+        // that spends its time on LAN/cloud latency is a hot-path bug).
+        if Some(index) == self.tailer_index {
+            return Err(format!("promote: index {index} is the sync tailer"));
         }
         if index == self.writer_index.load(Ordering::Relaxed) {
             return Ok(self.epoch.load(Ordering::Relaxed));
@@ -451,26 +644,37 @@ impl Cluster {
             .map_err(|e| format!("tick_flush instance {i}: {e}"))
     }
 
-    /// Member count.
+    /// Member count, tailer included (it IS a meshed member).
     pub fn instance_count(&self) -> usize {
         self.instances.len()
     }
 
+    /// Index of the +1 tailer member (`None` = plain cluster). The tailer
+    /// is skipped by fan-out, never promotable, never the writer.
+    pub fn tailer_index(&self) -> Option<usize> {
+        self.tailer_index
+    }
+
     /// Next read replica index, round-robin over healthy instances
-    /// (ejected ones skipped; the writer always qualifies). Driver
+    /// (ejected ones skipped; the writer always qualifies). The tailer
+    /// never serves fan-out reads — it exists to bridge, and hot-path
+    /// latency must never depend on it. Driver
     /// entry-point for fan-out without reimplementing picking.
     pub fn read_index(&self) -> usize {
         let n = self.instances.len();
-        // ponytail: wrapping_add, not checked math — a counter that runs
+        // ponytail: wrapping_add, not checked math - a counter that runs
         // for centuries is the only overflow story, and modulo is safe.
         let start = self.rr.fetch_add(1, Ordering::Relaxed);
         for k in 0..n {
             let i = (start + k) % n;
-            if self.instances[i].healthy.load(Ordering::Relaxed) {
+            if Some(i) != self.tailer_index
+                && self.instances[i].healthy.load(Ordering::Relaxed)
+            {
                 return i;
             }
         }
-        // Unreachable (writer never ejects) — fail closed to the writer.
+        // Unreachable (writer never ejects, never the tailer) - fail
+        // closed to the writer.
         self.writer_index.load(Ordering::Relaxed)
     }
 
@@ -606,6 +810,9 @@ impl Drop for Cluster {
     fn drop(&mut self) {
         for i in &self.instances {
             i._sync.stop();
+        }
+        if let Some(t) = &self.tailer_bridge {
+            t.stop();
         }
         // Runtime drop aborts the accept/tail tasks.
     }
