@@ -91,6 +91,9 @@ fn mesh_tailer_meshes_locally() {
     let dir = tmpdir("meshn1");
     let a = dir.join("a");
     let mut c = cfg();
+    // Unique socket dir per test: the default is relative ("socks/"),
+    // and tests in one binary share a working directory.
+    c.sock_dir = dir.join("socks");
     c.tailer_mesh = Some(mesh_knob());
     let cluster =
         Cluster::open_with_config(&[a.to_string_lossy().as_ref()], c).expect("open N+1");
@@ -116,6 +119,7 @@ fn cloud_tailer_opens_without_server() {
     let dir = tmpdir("cloudn1");
     let a = dir.join("a");
     let mut c = cfg();
+    c.sock_dir = dir.join("socks");
     c.tailer_cloud = Some(cloud_knob());
     let cluster =
         Cluster::open_with_config(&[a.to_string_lossy().as_ref()], c).expect("open N+1");
