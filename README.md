@@ -16,7 +16,7 @@ and N = 1 works as a degenerate single-node cluster.
 
 ```toml
 [dependencies]
-hakocluster = "0.4"
+hakocluster = "0.5"
 ```
 
 ## Multidatabase: named clusters in one process
@@ -51,8 +51,8 @@ Cargo features (opt-in, default build stays socket-only):
 
 ```toml
 [dependencies]
-hakocluster = { version = "0.4", features = ["tailer-mesh"] }   # join a LAN mesh room
-# hakocluster = { version = "0.4", features = ["tailer-cloud"] } # join a hub, or host this box's room
+hakocluster = { version = "0.5", features = ["tailer-mesh"] }   # join a LAN mesh room
+# hakocluster = { version = "0.5", features = ["tailer-cloud"] } # join a hub, or host this box's room
 ```
 
 ```rust
