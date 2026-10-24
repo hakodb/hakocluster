@@ -83,6 +83,12 @@ pub struct ClusterConfig {
     pub max_replica_lag_versions: Option<u64>,
     /// Directory holding one `instance-{i}.sock` per member.
     pub sock_dir: PathBuf,
+    /// Engine config applied to every member (issue #15). Cluster-level
+    /// knobs below deliberately override it (`durability_mode`,
+    /// `group_commit_interval_ms` per stagger), because the stagger policy
+    /// is meaningless unless it owns the per-instance flush interval.
+    /// `None` = `HakoConfig::default()` for every member.
+    pub member_config: Option<hakodb::config::HakoConfig>,
     /// Multi-box tailer via LAN mesh (issue #23): when set, open derives
     /// one extra (+1) member whose only extra job is bridging this box to
     /// a net-sync room. The tailer meshes locally like every member but
@@ -153,6 +159,7 @@ impl Default for ClusterConfig {
             stagger: StaggerPolicy::StaggeredStart { offset_ms: 1 },
             max_replica_lag_versions: Some(5_000_000),
             sock_dir: PathBuf::from("socks"),
+            member_config: None,
             tailer_mesh: None,
             tailer_cloud: None,
         }
@@ -452,7 +459,7 @@ impl Cluster {
                 // starts at its own open, so spaced opens = phased flushes.
                 std::thread::sleep(std::time::Duration::from_millis(stagger_gap));
             }
-            let mut hc = HakoConfig::default();
+            let mut hc: HakoConfig = cfg.member_config.clone().unwrap_or_default();
             hc.durability_mode = cfg.durability_mode;
             hc.group_commit_interval_ms = intervals[n];
             dbs.push(Arc::new(
@@ -990,3 +997,35 @@ impl Databases {
         self.order.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #15: one engine config, applied to every member; the cluster
+    /// knobs still win. `sync_excluded` is a cheap observable that proves
+    /// the template reached the freshly opened engine.
+    #[test]
+    fn member_config_reaches_members() {
+        let base =
+            std::env::temp_dir().join(format!("hako-member-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let member = HakoConfig {
+            sync_excluded: vec!["door".into()],
+            ..Default::default()
+        };
+        let cfg = ClusterConfig {
+            sock_dir: base.with_extension("sync"),
+            member_config: Some(member),
+            ..Default::default()
+        };
+
+        let cluster = Cluster::open_with_config(&[base.to_str().unwrap()], cfg).unwrap();
+        assert_eq!(cluster.instance_count(), 1);
+        let db = &cluster.instances[0].db;
+        assert!(db.is_sync_excluded_effective("door"));
+        assert!(!db.is_sync_excluded_effective("other"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
