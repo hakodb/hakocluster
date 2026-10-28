@@ -962,6 +962,8 @@ impl Databases {
         }
     }
 
+    // type_complexity: one-off private fn — aliasing adds noise, not clarity.
+    #[allow(clippy::type_complexity)]
     fn open_all(
         specs: Vec<DbSpec>,
         sock_root: &Path,

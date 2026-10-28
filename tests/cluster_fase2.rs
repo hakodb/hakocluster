@@ -7,7 +7,6 @@
 use std::time::{Duration, Instant};
 
 use hakocluster::{Cluster, ClusterConfig, StaggerPolicy};
-use hakodb::config::DurabilityMode;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 
@@ -35,6 +34,8 @@ fn put_kv(c: &Cluster, col: &str, id: &str, v: &str) {
     c.put_owned(col, id, d).unwrap();
 }
 
+// ponytail: kept for ad-hoc debugging runs (unused in normal `cargo test`).
+#[allow(dead_code)]
 fn poll_until(label: &str, mut f: impl FnMut() -> bool) {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(15) {

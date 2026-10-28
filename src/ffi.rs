@@ -12,6 +12,8 @@
 //! cdylib, never hand-synced. Release assets carry the header from the
 //! build that produced them.
 
+#![allow(clippy::not_unsafe_ptr_arg_deref)] // outer C ABI: callers guarantee pointer validity
+
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -39,7 +41,7 @@ pub struct HK_Databases {
 }
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 macro_rules! shield {
@@ -239,7 +241,7 @@ fn open_impl(paths_json: &str, cfg_json: Option<&str>) -> Result<*mut HK_Cluster
     if cfg.sock_dir.as_os_str().is_empty() {
         return Err("config needs sock_dir".into());
     }
-    let cluster = Cluster::open_with_config(&refs, cfg).map_err(|e| e)?;
+    let cluster = Cluster::open_with_config(&refs, cfg)?;
     Ok(Box::into_raw(Box::new(HK_Cluster { inner: Arc::new(cluster) })))
 }
 
@@ -403,7 +405,7 @@ fn json_to_doc(js: &str) -> Result<HakoDoc, String> {
         if k == "_time" {
             continue;
         }
-        let hv = Value::from_json(val.clone()).map_err(|e| e)?;
+        let hv = Value::from_json(val.clone())?;
         fields.push((std::sync::Arc::from(k.as_str()), hv));
     }
     Ok(HakoDoc { fields, _time: 0 })
@@ -558,7 +560,7 @@ fn parse_query(js: &str) -> Result<Query, String> {
             .ok_or("where needs field")?;
         let op = w.get("op").and_then(|x| x.as_str()).unwrap_or("eq");
         let val = w.get("value").cloned().unwrap_or(serde_json::Value::Null);
-        let hv = Value::from_json(val).map_err(|e| e)?;
+        let hv = Value::from_json(val)?;
         match op {
             "eq" => q = q.where_eq(field, hv),
             _ => return Err(format!("unsupported op '{op}' (eq only for now)")),

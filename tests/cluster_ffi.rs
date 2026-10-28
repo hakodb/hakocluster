@@ -38,7 +38,7 @@ fn ffi_put_get_query_roundtrip() {
     let dir = tmp("rt");
     let sock = tmp("rt-sock");
     let paths = format!(r#"["{}"]"#, dir.replace('\\', "\\\\"));
-    let h = unsafe { hk_cluster_open(cs(&paths), cs(&sock)) };
+    let h = hk_cluster_open(cs(&paths), cs(&sock));
     assert!(!h.is_null());
 
     let id = unsafe {
@@ -68,7 +68,7 @@ fn ffi_put_get_query_roundtrip() {
     .expect("query must return");
     assert!(rows.contains("k1"), "got: {rows}");
 
-    unsafe { hk_cluster_close(h) };
+    hk_cluster_close(h);
 }
 
 #[test]
@@ -76,22 +76,22 @@ fn ffi_promote_health_tick() {
     let dir = tmp("ph");
     let sock = tmp("ph-sock");
     let paths = format!(r#"["{}"]"#, dir.replace('\\', "\\\\"));
-    let h = unsafe { hk_cluster_open(cs(&paths), cs(&sock)) };
+    let h = hk_cluster_open(cs(&paths), cs(&sock));
     assert!(!h.is_null());
 
-    assert_eq!(unsafe { hk_cluster_epoch(h) }, 0);
-    assert_eq!(unsafe { hk_cluster_promote(h, 0) }, 0); // no-op self
-    assert!(unsafe { hk_cluster_promote(h, 9) } < 0); // out of range
+    assert_eq!(hk_cluster_epoch(h), 0);
+    assert_eq!(hk_cluster_promote(h, 0), 0); // no-op self
+    assert!(hk_cluster_promote(h, 9) < 0); // out of range
     let health = unsafe { take(hk_cluster_refresh_health(h)) }.unwrap();
     assert!(health.contains("healthy"), "got: {health}");
-    assert_eq!(unsafe { hk_cluster_tick_flush(h) }, 0);
+    assert_eq!(hk_cluster_tick_flush(h), 0);
 
-    unsafe { hk_cluster_close(h) };
+    hk_cluster_close(h);
 }
 
 #[test]
 fn ffi_open_rejects_garbage() {
     let sock = tmp("bad-sock");
-    assert!(unsafe { hk_cluster_open(cs("not-json"), cs(&sock)) }.is_null());
-    assert!(!unsafe { hk_cluster_last_error() }.is_null());
+    assert!(hk_cluster_open(cs("not-json"), cs(&sock)).is_null());
+    assert!(!hk_cluster_last_error().is_null());
 }

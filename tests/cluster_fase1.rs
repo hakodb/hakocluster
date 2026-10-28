@@ -35,12 +35,11 @@ fn cfg(sock: &std::path::Path) -> ClusterConfig {
 fn put_kv(c: &Cluster, col: &str, id: &str, v: &str) {
     let mut d = HakoDoc::default();
     d.insert("v", Value::String(v.into()));
-    let mut owned = HakoDoc::default();
-    owned.fields = d.fields;
-    owned._time = d._time;
-    c.put_owned(col, id, owned).unwrap();
+    c.put_owned(col, id, d).unwrap();
 }
 
+// ponytail: kept for ad-hoc debugging runs (unused in normal `cargo test`).
+#[allow(dead_code)]
 fn poll_until(label: &str, mut f: impl FnMut() -> bool) {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(15) {
