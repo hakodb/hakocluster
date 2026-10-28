@@ -1,6 +1,6 @@
 [package]
 name = "hakocluster"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "In-process dispatcher over N hakodb instances: reads fan out, writes route, socket_sync keeps replicas identical"
 license = "MIT"
@@ -18,7 +18,7 @@ tailer-cloud = ["hakodb/cloud-sync"]
 [dependencies]
 # ponytail: only the socket-sync lane (tokio). net-sync/cloud-sync pull
 # mdns/rustls/tungstenite — unneeded here, and each is minutes of compile.
-hakodb = { version = "0.19.6", default-features = false, features = ["socket-sync"] }
+hakodb = { version = "0.20.0", default-features = false, features = ["socket-sync"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 # JSON boundary for the C ABI (go/pascal consumers): docs and queries
 # cross as UTF-8 strings, never as structs.
