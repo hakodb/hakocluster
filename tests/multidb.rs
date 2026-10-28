@@ -12,7 +12,6 @@ use hakocluster::{ClusterConfig, Databases, DbSpec};
 use hakodb::config::DurabilityMode;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
-use hakodb::query::query::Query;
 
 fn tmp(label: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -41,10 +40,7 @@ fn put_kv(dbs: &Databases, db: &str, col: &str, id: &str, v: &str) {
     let c = dbs.get(db).unwrap();
     let mut d = HakoDoc::default();
     d.insert("v", Value::String(v.into()));
-    let mut owned = HakoDoc::default();
-    owned.fields = d.fields;
-    owned._time = d._time;
-    c.put_owned(col, id, owned).unwrap();
+    c.put_owned(col, id, d).unwrap();
 }
 
 fn get_v(dbs: &Databases, db: &str, col: &str, id: &str) -> Option<String> {
@@ -132,46 +128,46 @@ fn ffi_multidb_roundtrip() {
     let cfg = format!(
         r#"{{"sock_root":"{root}","databases":[{{"name":"a","paths":["{da}"]}},{{"name":"b","paths":["{db}"]}}]}}"#
     );
-    let h = unsafe { hk_databases_open(cs(&cfg)) };
+    let h = hk_databases_open(cs(&cfg));
     assert!(!h.is_null());
 
     let names = unsafe { take(hk_databases_names(h)) }.unwrap();
     assert!(names.contains("\"a\"") && names.contains("\"b\""), "got: {names}");
 
     // Unknown name: null + error (no default).
-    assert!(unsafe { hk_db_get(h, cs("nope")) }.is_null());
-    assert!(!unsafe { hk_cluster_last_error() }.is_null());
+    assert!(hk_db_get(h, cs("nope")).is_null());
+    assert!(!hk_cluster_last_error().is_null());
 
     // Same cluster behind fresh boxes: write via one handle...
-    let ha = unsafe { hk_db_get(h, cs("a")) };
+    let ha = hk_db_get(h, cs("a"));
     assert!(!ha.is_null());
     let id = unsafe { take(hk_cluster_put(ha, cs("c"), cs("k1"), cs(r#"{"v":"one"}"#))) };
     assert_eq!(id.as_deref(), Some("k1"));
-    unsafe { hk_cluster_close(ha) };
+    hk_cluster_close(ha);
 
     // ...read via another handle on the same database...
-    let ha2 = unsafe { hk_db_get(h, cs("a")) };
+    let ha2 = hk_db_get(h, cs("a"));
     let doc = unsafe { take(hk_cluster_get(ha2, cs("c"), cs("k1"))) }.expect("get must hit");
     assert!(doc.contains(r#""v":"one""#), "got: {doc}");
-    unsafe { hk_cluster_close(ha2) };
+    hk_cluster_close(ha2);
 
     // ...invisible from the other database (isolation across the ABI).
-    let hb = unsafe { hk_db_get(h, cs("b")) };
+    let hb = hk_db_get(h, cs("b"));
     assert!(unsafe { take(hk_cluster_get(hb, cs("c"), cs("k1"))) }.is_none());
-    unsafe { hk_cluster_close(hb) };
+    hk_cluster_close(hb);
 
-    unsafe { hk_databases_close(h) };
+    hk_databases_close(h);
 }
 
 #[test]
 fn ffi_multidb_rejects_garbage() {
-    assert!(unsafe { hk_databases_open(cs("not-json")) }.is_null());
-    assert!(!unsafe { hk_cluster_last_error() }.is_null());
+    assert!(hk_databases_open(cs("not-json")).is_null());
+    assert!(!hk_cluster_last_error().is_null());
     let root = tmp("ffi-badroot").to_string_lossy().replace('\\', "\\\\");
     let cfg = format!(r#"{{"sock_root":"{root}","databases":[]}}"#);
-    assert!(unsafe { hk_databases_open(cs(&cfg)) }.is_null());
+    assert!(hk_databases_open(cs(&cfg)).is_null());
     let cfg = format!(
         r#"{{"sock_root":"{root}","databases":[{{"name":"x","paths":[]}}]}}"#
     );
-    assert!(unsafe { hk_databases_open(cs(&cfg)) }.is_null());
+    assert!(hk_databases_open(cs(&cfg)).is_null());
 }

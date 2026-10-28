@@ -35,6 +35,8 @@ fn kv(v: &str) -> HakoDoc {
     d
 }
 
+// ponytail: kept for ad-hoc debugging runs (unused in normal `cargo test`).
+#[allow(dead_code)]
 fn poll_until(label: &str, mut f: impl FnMut() -> bool) {
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(15) {
