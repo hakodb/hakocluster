@@ -51,8 +51,8 @@ Cargo features (opt-in, default build stays socket-only):
 
 ```toml
 [dependencies]
-hakocluster = { version = "0.5", features = ["tailer-mesh"] }   # join a LAN mesh room
-# hakocluster = { version = "0.5", features = ["tailer-cloud"] } # join a hub, or host this box's room
+hakocluster = { git = "https://github.com/hakodb/hakocluster", features = ["tailer-mesh"] }  # join a LAN mesh room
+# hakocluster = { git = "https://github.com/hakodb/hakocluster", features = ["tailer-cloud"] } # join a hub, or host this box's room
 ```
 
 ```rust
