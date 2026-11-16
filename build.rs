@@ -1,14 +1,26 @@
 fn main() {
-    // Dev-loop shortcut (same pattern as hakodb): HAKOCLUSTER_SKIP_CBINDGEN=1
-    // skips header generation (seconds per rebuild on big trees).
-    // CI/release never set it, so shipped headers always regenerate.
+    // Header generation is opt-in via the `header` feature (same pattern
+    // as hakodb 0.20.4): release/tag CI and sync scripts build with
+    // `--features header`, everything else compiles zero header
+    // machinery — the cbindgen build-dependency is optional and stays
+    // off. HAKOCLUSTER_SKIP_CBINDGEN=1 still forces a skip in
+    // header-enabled dev loops; set per-invocation, not globally.
     // Link-search + lib hygiene below always run (dependents link
     // against them even in dev loops).
+    #[cfg(feature = "header")]
     if std::env::var("HAKOCLUSTER_SKIP_CBINDGEN").is_err() {
         gen_header();
     }
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
+
+    // One line of truth in every build's output: protects the header flow
+    // from silent regressions (the 1.100 layout change produced none).
+    println!(
+        "cargo:warning=hakocluster build-script: header feature={} skip_env={}",
+        std::env::var_os("CARGO_FEATURE_HEADER").is_some(),
+        std::env::var_os("HAKOCLUSTER_SKIP_CBINDGEN").is_some(),
+    );
 
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
     let target_dir = std::path::Path::new("target").join(&profile);
@@ -31,9 +43,11 @@ if !target.contains("msvc") {
     println!("cargo:rustc-link-search=native={}", target_dir.display());
 }
 
+#[cfg(feature = "header")]
 fn gen_header() {
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir should exist");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
     let output = std::path::Path::new(&out_dir).join("hakocluster.h");
 
     // ponytail: absolute path — a relative "cbindgen.toml" silently misses
@@ -52,13 +66,27 @@ fn gen_header() {
         .expect("Unable to generate C header")
         .write_to_file(&output);
     // ponytail: stable per-target copy next to the binaries. OUT_DIR hides
-    // under target/<triple>/<profile>/build/<pkg>-<hash>/out — unusable as
-    // a consumer path. The profile dir (3 ancestors up) is stable across
-    // hosts, triples, and profiles, so release CI, sync scripts, and the
-    // C smoke test all take `target/<...>/hakocluster.h` from the build
-    // that produced it. No checked-in header (drift-proof: declarations
-    // always match the built cdylib).
-    if let Some(profile_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
-        let _ = std::fs::copy(&output, profile_dir.join("hakocluster.h"));
-    }
+    // under build/<pkg>/<hash>/out (cargo 1.100 layout; formerly
+    // build/<pkg>-<hash>/out) — unusable as a consumer path, and a fixed
+    // ancestor count no longer points at target/<profile>/. So the copy
+    // target is the profile dir found by NAME, and both the generate and
+    // copy steps fail loudly (silence here shipped broken releases).
+    // No checked-in header (drift-proof: declarations always match the
+    // built cdylib).
+    let profile_dir = profile_dir_of(&out_dir, &profile)
+        .expect("profile dir not found above OUT_DIR - refusing to ship a header consumers can't find");
+    std::fs::copy(&output, profile_dir.join("hakocluster.h"))
+        .expect("Unable to copy C header");
+}
+
+/// The profile dir (`target/<profile>/`) above OUT_DIR, located by NAME:
+/// the first ancestor whose final component matches the PROFILE env value
+/// ("release"/"debug"). Depth-independent - survives cargo layout changes
+/// (same fix as hakodb 0.20.3).
+#[cfg(feature = "header")]
+fn profile_dir_of(out_dir: &str, profile: &str) -> Option<std::path::PathBuf> {
+    std::path::Path::new(out_dir)
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == profile))
+        .map(|p| p.to_path_buf())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hakocluster"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 description = "In-process dispatcher over N hakodb instances: reads fan out, writes route, socket_sync keeps replicas identical"
 license = "MIT"
@@ -14,6 +14,10 @@ crate-type = ["cdylib", "rlib"]
 [features]
 tailer-mesh = ["hakodb/net-sync"]
 tailer-cloud = ["hakodb/cloud-sync"]
+# Opt-in FFI header generation (build.rs): enabled by release/tag CI
+# (`cargo build --release --features header`); Rust dependents build
+# without it and compile zero header machinery.
+header = ["dep:cbindgen"]
 
 [dependencies]
 # ponytail: only the socket-sync lane (tokio). net-sync/cloud-sync pull
@@ -25,9 +29,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "m
 serde_json = "1"
 
 [build-dependencies]
-# Header generation (same pattern as hakodb): cbindgen emits
-# target/<profile>/hakocluster.h from the #[no_mangle] fns every build.
-cbindgen = "0.28"
+# Header generation (same pattern as hakodb 0.20.4): cbindgen emits
+# target/<profile>/hakocluster.h when built with --features header.
+cbindgen = { version = "0.28", optional = true }
 
 # ponytail: same size treatment as hakodb (duelled there): thin-LTO +
 # single codegen unit + strip, opt-level 3 kept (opt-z rejected: +20-50%
