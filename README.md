@@ -100,3 +100,30 @@ procedure hk_cluster_string_free(p: PChar); cdecl; external 'hakocluster';
 N > 1 needs a unix host (socket peering); elsewhere open refuses N > 1
 and N = 1 works as a single-node cluster. `stagger:"c"`
 (ManualRotation) additionally requires `"durability":"manual"`.
+
+## API guidance: query and write paths
+
+Consumers should not have to guess which execution or write entry point to use. The core exposes one canonical executor plus advisory-deprecated wrappers and several materialization lanes with different costs.
+
+### Execution lanes
+
+| Lane | Returns | Use when |
+|---|---|---|
+| canonical executor (`hk_query_execute_ex` / SDK default) | JSON documents for an application | ordinary API calls |
+| JSON egress (`hk_query_execute_json`) | JSON from pinned bytes, no owned document | wire/egress output |
+| handles (`hk_query_execute_to_handles`) | borrowed document handles | engine throughput, caller reads selected fields |
+| raw (`hk_query_execute_raw`) | pinned storage bytes | index-satisfied scans, zero decode |
+| aggregation / explain | aggregate values or plan report | tuning and aggregate-only queries |
+
+Do not compare a JSON-document lane with an engine-only lane and call it the same benchmark. Mark lanes without an equivalent in another engine as not applicable.
+
+### In this repository
+
+- canonical executor and append-only ABI contract
+- batch writes and sync feature flags
+- index readiness and quiescence for consumers
+
+### Further reading
+
+- Core decision table: https://github.com/hakodb/hakodb/blob/main/docs/ffi-query-lanes.md
+- Manual C ABI chapter: https://hakodb.github.io/manual/sdk-c-abi.html
